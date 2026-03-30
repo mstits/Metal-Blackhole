@@ -44,9 +44,18 @@ target_link_libraries(MetalBlackhole PRIVATE
     ${MPS_FRAMEWORK}
 )
 
-# Shader copying
+# Compiler hardening (SEC-07)
+target_compile_options(MetalBlackhole PRIVATE
+    -Wall -Wextra -Wformat-security
+    -fstack-protector-strong
+)
+
+# Shader copying (runtime compilation — see README Security section for metallib migration)
 add_custom_command(TARGET MetalBlackhole POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/geodesic.metal
     $<TARGET_FILE_DIR:MetalBlackhole>/geodesic.metal
+    COMMAND ${CMAKE_COMMAND} -E copy
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/ShaderCommon.h
+    $<TARGET_FILE_DIR:MetalBlackhole>/ShaderCommon.h
 )

@@ -1,52 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// --- SHARED STRUCTS ---
-
-struct SimObject {
-    float4 posRadius;
-    float4 color;
-    float  mass;
-    float  _pad0[3];
-    float4 velocity;
-};
-
-struct CameraData {
-    float4 camPos;
-    float4 camRight;
-    float4 camUp;
-    float4 camForward;
-    float  tanHalfFov;
-    float  aspect;
-    int    moving;
-    int    _pad4;
-};
-
-struct SystemUniforms {
-    float time;
-    float spin;
-    float star_scint;
-    float nebula_int;
-    float charge;
-    float dt_sim;
-    float bloom_threshold;
-    float flare_int;
-    float motion_blur;
-    float film_grain;
-    float disk_density;
-    float disk_height;
-    float shadow_int;
-    float gw_amp;
-    float _pad[2];
-};
-
-struct ObjectsUniform {
-    int count;
-};
-
-struct GridUniforms {
-    float4x4 viewProj;
-};
+// Structs (SimObject, CameraData, SystemUniforms, ObjectsUniform, GridUniforms)
+// are provided by ShaderCommon.h, prepended at compile time.
 
 // --- HIGH-FIDELITY NOISE ENGINE ---
 
@@ -77,6 +33,19 @@ static inline half fbm_half(float3 p, float t) {
     half a = 0.5h;
     [[unroll]]
     for (int i=0; i<5; i++) {
+        v += a * noise_half(p + t * 0.3f);
+        p = p * 2.02f + float3(10.0f);
+        a *= 0.5h;
+    }
+    return v;
+}
+
+// 3-octave variant for raytrace disk sampling (cheaper, visually close)
+static inline half fbm_half3(float3 p, float t) {
+    half v = 0.0h;
+    half a = 0.5h;
+    [[unroll]]
+    for (int i=0; i<3; i++) {
         v += a * noise_half(p + t * 0.3f);
         p = p * 2.02f + float3(10.0f);
         a *= 0.5h;
@@ -158,6 +127,13 @@ static inline void stepRK4(thread float3& pos, thread float3& vel, float dt, flo
     vel = normalize(vel + (k1v + 2.0f*k2v + 2.0f*k3v + k4v) * (dt / 6.0f));
 }
 
+// Euler integrator for weak-field regions (r > 8) — 1 force eval vs 4
+static inline void stepEuler(thread float3& pos, thread float3& vel, float dt, float a, float Q) {
+    float3 acc = get_acc(pos, vel, a, Q);
+    pos += vel * dt;
+    vel = normalize(vel + acc * dt);
+}
+
 kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
                      texture2d<float, access::sample> fluidTex [[texture(1)]],
                      constant CameraData& cam [[buffer(0)]],
@@ -188,16 +164,25 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
     const float r_in = 2.6f;
     const float r_out = 22.0f;
     const float disk_h = sys.disk_height;
+    const float disk_h3 = disk_h * 3.0f;
 
-    for (int i=0; i<2000; i++) {
+    for (int i=0; i<1200; i++) {
         float r = length(pos);
         if (r < 1.005f) { trans = 0.0f; break; }
-        if (r > 1200.0f) break;
+        if (r > 500.0f) break;
+        // Early exit: ray heading outward past all disk/object influence
+        if (r > 30.0f && dot(pos, vel) > 0.0f) break;
         
-        float dt = max(r * 0.03f, 0.001f);
-        if (abs(pos.y) < disk_h * 3.0f) dt = min(dt, 0.06f);
+        // INVARIANT: disk step clamp must stay at 0.06 — do NOT reduce.
+        // Lower values exhaust iteration budget for edge-on rays.
+        // INVARIANT: raytrace must run at FULL resolution — no half-res.
+        // Half-res causes sub-pixel thin disk to bleed stars through.
+        float dt = max(r * 0.06f, 0.001f);
+        if (abs(pos.y) < disk_h3) dt = min(dt, 0.06f);
         
-        stepRK4(pos, vel, dt, sys.spin, sys.charge);
+        // Weak-field: Euler (1 force eval). Strong-field: RK4 (4 force evals).
+        if (r > 8.0f) stepEuler(pos, vel, dt, sys.spin, sys.charge);
+        else          stepRK4(pos, vel, dt, sys.spin, sys.charge);
         
         if (simd_any(r < 150.0f)) {
             float3 p_world = pos * rs + bhPos;
@@ -220,47 +205,76 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
                 float2 fluid_uv = pos.xz / 50.0f + 0.5f;
                 constexpr sampler s(filter::linear);
                 float2 f_val = fluidTex.sample(s, fluid_uv).xy;
-                float noise_val = (float)fbm_half(float3(rh * 1.8f, atan2(pos.z, pos.x) * 5.0f, sys.time * 0.1f), sys.time * 0.02f);
+                float noise_val = (float)fbm_half3(float3(rh * 1.8f, atan2(pos.z, pos.x) * 5.0f, sys.time * 0.1f), sys.time * 0.02f);
                 noise_val = mix(noise_val, f_val.x, 0.6f + 0.4f * f_val.y);
 
-                float density = smoothstep(0.0f, 0.05f, d_norm) * (1.0f - smoothstep(0.45f, 1.0f, d_norm)) * pow(1.0f - abs(pos.y)/disk_h, 3.0f) * (0.1f + 0.9f * noise_val) * sys.disk_density;
+                float y_frac = 1.0f - abs(pos.y) / disk_h;
+                float density = smoothstep(0.0f, 0.05f, d_norm) * (1.0f - smoothstep(0.45f, 1.0f, d_norm)) * (y_frac * y_frac * y_frac) * (0.1f + 0.9f * noise_val) * sys.disk_density;
                 
-                float3 dCol = mix(float3(0.4h, 0.8h, 1.0h), float3(1.0h, 0.7h, 0.2h), (half)smoothstep(0.0f, 0.2f, d_norm));
-                dCol = mix(dCol, float3(0.8h, 0.1h, 0.0h), (half)smoothstep(0.2f, 0.6f, d_norm));
-                dCol = mix(dCol, float3(0.1h, 0.0h, 0.3h), (half)smoothstep(0.6f, 1.0f, d_norm));
+                half h_dnorm = half(d_norm);
+                half3 dCol = mix(half3(0.4h, 0.8h, 1.0h), half3(1.0h, 0.7h, 0.2h), smoothstep(half(0.0h), half(0.2h), h_dnorm));
+                dCol = mix(dCol, half3(0.8h, 0.1h, 0.0h), smoothstep(half(0.2h), half(0.6h), h_dnorm));
+                dCol = mix(dCol, half3(0.1h, 0.0h, 0.3h), smoothstep(half(0.6h), half(1.0h), h_dnorm));
                 
-                float cos_v = dot(vel, normalize(float3(-pos.z, 0.0f, pos.x)));
-                float beaming = 1.0f / pow(max(0.01f, 1.0f - 0.98f * cos_v * sqrt(max(0.0f, 1.0f/rh))), 4.0f);
-                float redshift = sqrt(max(0.01f, 1.0f - 1.0f/rh));
+                float inv_rh = 1.0f / rh;
+                float2 tang = float2(-pos.z, pos.x) * rsqrt(pos.z*pos.z + pos.x*pos.x);
+                float cos_v = vel.x * tang.x + vel.z * tang.y;
+                float beaming_base = max(0.01f, 1.0f - 0.98f * cos_v * sqrt(max(0.0f, inv_rh)));
+                float beaming = 1.0f / (beaming_base * beaming_base * beaming_base * beaming_base);
+                float redshift = sqrt(max(0.01f, 1.0f - inv_rh));
                 
                 float shadow = 1.0f;
                 if (sys.shadow_int > 0.0f) {
                     float3 shadow_p = pos;
                     float shadow_accum = 0.0f;
                     [[unroll]]
-                    for (int s=0; s<4; s++) {
-                        shadow_p += float3(0, 0.1f, 0); 
+                    for (int s=0; s<2; s++) {
+                        shadow_p += float3(0, 0.2f, 0); 
                         float s_rh = length(shadow_p.xz);
-                        if (s_rh > r_in && s_rh < r_out && abs(shadow_p.y) < disk_h) shadow_accum += 0.2f;
+                        if (s_rh > r_in && s_rh < r_out && abs(shadow_p.y) < disk_h) shadow_accum += 0.4f;
                     }
                     shadow = exp(-shadow_accum * sys.shadow_int * 5.0f);
                 }
 
                 float step_opacity = density * 0.7f;
-                col_accum += trans * dCol * 35.0f * beaming * redshift * step_opacity * shadow;
+                col_accum += trans * float3(dCol) * 35.0f * beaming * redshift * step_opacity * shadow;
                 trans *= (1.0f - step_opacity);
             }
         }
         
-        float glow = 0.0006f * (1.0f / (r*r));
-        col_accum += trans * float3(0.12f, 0.07f, 0.04f) * glow * 60.0f;
-        trans *= (1.0f - glow);
+        // Glow only matters close to the BH — at r=10 it's 0.000006, negligible
+        if (r < 5.0f) {
+            float glow = 0.0006f / (r*r);
+            col_accum += trans * float3(0.12f, 0.07f, 0.04f) * glow * 60.0f;
+            trans *= (1.0f - glow);
+        }
 
         if (trans < 0.005f) break;
     }
     
-    float3 final = col_accum + trans * (float3)sampleBackground_half(vel, sys.time, sys.star_scint, sys.nebula_int);
-    out.write(float4(final, 1.0f), pix);
+    // Gravitational lensing of distant stars: check if the deflected exit
+    // direction `vel` points toward any star. The geodesic bending IS the lens.
+    if (trans > 0.005f) {
+        float3 bg = (float3)sampleBackground_half(vel, sys.time, sys.star_scint, sys.nebula_int);
+        for (int j = 0; j < u_obj.count; j++) {
+            if (objs[j].mass <= 1e35f) {
+                float3 star_dir = normalize(objs[j].posRadius.xyz - bhPos);
+                float star_dist = length(objs[j].posRadius.xyz - bhPos);
+                float ang_radius = objs[j].posRadius.w / star_dist;
+                float cos_angle = dot(vel, star_dir);
+                float threshold = 1.0f - ang_radius * ang_radius * 0.5f;
+                if (cos_angle > threshold) {
+                    // Inverse-square dimming: star brightness scales with (R/d)²
+                    float solid_angle = ang_radius * ang_radius;
+                    float brightness = min(solid_angle * 800.0f, 4.0f);  // cap to prevent flare overdrive
+                    float limb = smoothstep(threshold, 1.0f, cos_angle);
+                    bg = mix(bg, objs[j].color.xyz * brightness, limb);
+                }
+            }
+        }
+        col_accum += trans * bg;
+    }
+    out.write(float4(col_accum, 1.0f), pix);
 }
 
 // --- POST-PROCESSING ---
@@ -274,14 +288,14 @@ kernel void post_process_suite(texture2d<float, access::read> inTex [[texture(0)
     if (pix.x >= w || pix.y >= h) return;
 
     float3 col = inTex.read(pix).rgb;
-    
+
     // Anamorphic Flare
     float flare = 0.0f;
-    for(int i=-20; i<=20; i++) {
+    for(int i=-10; i<=10; i++) {
         uint2 p = uint2(clamp(int(pix.x) + i*4, 0, int(w)-1), pix.y);
-        flare += max(0.0f, dot(inTex.read(p).rgb, float3(0.2126, 0.7152, 0.0722)) - sys.bloom_threshold);
+        flare += max(0.0f, dot(inTex.read(p).rgb, float3(0.2126f, 0.7152f, 0.0722f)) - sys.bloom_threshold);
     }
-    col += float3(0.1, 0.3, 1.0) * (flare / 41.0f) * sys.flare_int;
+    col += float3(0.1f, 0.3f, 1.0f) * (flare / 21.0f) * sys.flare_int;
 
     float2 uv = (float2(pix) + 0.5f) / float2(w, h);
     col = mix(col, accumTex.sample(sampler(filter::linear), uv).rgb, sys.motion_blur);
@@ -293,17 +307,24 @@ kernel void post_process_suite(texture2d<float, access::read> inTex [[texture(0)
     outTex.write(float4(pow(col, 0.4545f), 1.0f), pix);
 }
 
-kernel void update_physics(device SimObject* objects [[buffer(0)]], constant ObjectsUniform& u [[buffer(1)]], uint id [[thread_position_in_grid]]) {
+kernel void update_physics(device SimObject* objects [[buffer(0)]], constant ObjectsUniform& u [[buffer(1)]], constant SystemUniforms& sys [[buffer(2)]], uint id [[thread_position_in_grid]]) {
     if (id >= (uint)u.count || objects[id].mass > 1e35f) return;
-    float dt = 40000.0f; float G = 6.67430e-11f;
-    float3 p = objects[id].posRadius.xyz; float3 v = objects[id].velocity.xyz; float3 f = float3(0.0f);
+    float dt = 2500000.0f * sys.dt_sim;
+    float G = 6.67430e-11f;
+    float eps = 1e9f;
+    float3 p = objects[id].posRadius.xyz;
+    float3 v = objects[id].velocity.xyz;
+    float3 f = float3(0.0f);
     for (int i=0; i<u.count; i++) {
         if (i == (int)id) continue;
-        float3 r_v = objects[i].posRadius.xyz - p; float r = length(r_v);
-        if (r > 1e6f) f += normalize(r_v) * (G * objects[i].mass / (r * r));
+        float3 r_v = objects[i].posRadius.xyz - p;
+        float r2 = dot(r_v, r_v);
+        f += normalize(r_v) * (G * objects[i].mass / (r2 + eps * eps));
     }
-    v += f * dt; p += v * dt;
-    objects[id].velocity.xyz = v; objects[id].posRadius.xyz = p;
+    v += f * dt;
+    p += v * dt;
+    objects[id].velocity.xyz = v;
+    objects[id].posRadius.xyz = p;
 }
 
 struct VertexOut { float4 position [[position]]; float depth; };
@@ -324,6 +345,9 @@ vertex VertexOut grid_vertex(VertexIn in [[stage_in]], constant GridUniforms& u 
         }
         p.y += ripple - (bh->posRadius.w * 10.0f) / (1.0f + d / (bh->posRadius.w * 3.0f));
     }
-    p.y -= 3e11f; out.position = u.viewProj * float4(p, 1.0f); return out;
+    float grid_drop = bh ? bh->posRadius.w * 24.0f : 3.0e11f;
+    p.y -= grid_drop;
+    out.position = u.viewProj * float4(p, 1.0f);
+    return out;
 }
 fragment float4 grid_fragment(VertexOut in [[stage_in]]) { return float4(0.0f, 0.5f, 1.0f, 0.4f); }

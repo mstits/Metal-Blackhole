@@ -24,9 +24,14 @@ A high-fidelity, real-time black hole simulation optimized for Apple Silicon via
 - **Motion Blur:** Temporal feedback loops for shutter-accurate trails.
 - **Film Science:** 70mm film grain and optical vignetting.
 
-### Performance
+### Performance (Apple Silicon Optimized)
 - **Triple Buffering:** Zero CPU-GPU synchronization stalls.
-- **Half-Precision (FP16):** Optimized kernels for doubled arithmetic throughput.
+- **MTLMathModeRelaxed:** FMA-enabled compilation with IEEE-compliant sqrt/division for geodesic accuracy.
+- **SIMD-Aligned Threadgroups:** 32×8 threadgroups aligned with Apple Silicon's 32-wide execution width.
+- **Non-Uniform Dispatch:** `dispatchThreads` for hardware-managed boundary handling.
+- **Adaptive Integration:** Euler for weak-field (r > 8), RK4 for strong-field — 1 vs 4 force evaluations per step.
+- **Half-Precision (FP16):** Disk color computation at 2× ALU throughput.
+- **Double-Buffered Intermediates:** Eliminates per-frame blit copy for motion blur accumulation.
 - **SIMD Group Voting:** Low-level culling of unnecessary calculations.
 
 ## Controls
@@ -43,6 +48,29 @@ cmake ..
 make
 ./MetalBlackhole
 ```
+
+## Security Considerations
+
+### Runtime Shader Compilation (GPU Code Injection Risk)
+
+Shader source files (`geodesic.metal`, `ShaderCommon.h`) are loaded from the filesystem at runtime and compiled into GPU code via `newLibraryWithSource:`. If an attacker can write to the build/executable directory, they could inject arbitrary GPU compute code.
+
+**Recommended Mitigation:** With full Xcode installed, precompile shaders to a signed `.metallib` binary:
+
+```bash
+xcrun -sdk macosx metal -c -I include/ -std=metal3.0 shaders/geodesic.metal -o build/geodesic.air
+xcrun -sdk macosx metallib build/geodesic.air -o build/geodesic.metallib
+```
+
+Then load via `[device newLibraryWithURL:...]` instead of runtime source compilation. **Do NOT use `-ffast-math`** — it breaks geodesic accuracy at edge-on camera angles.
+
+### Input Validation
+
+All GPU uniform values are clamped to valid ranges at the CPU→GPU write site to prevent NaN propagation, division-by-zero, or excessive loop iteration from out-of-range parameters.
+
+### Compiler Hardening
+
+The build enables `-Wall -Wextra -Wformat-security -fstack-protector-strong`.
 
 ## Credits
 Built by [mstits](https://github.com/mstits).

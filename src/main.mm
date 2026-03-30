@@ -23,6 +23,9 @@
 using namespace glm;
 using namespace std;
 
+// --- SHARED STRUCTS (single source of truth in ShaderCommon.h) ---
+#include "ShaderCommon.h"
+
 const int WINDOW_WIDTH = 1200;
 const int WINDOW_HEIGHT = 800;
 
@@ -31,53 +34,6 @@ const double c_const = 299792458.0;
 const double SagA_rs = 2.0 * G_const * 8.54e36 / (c_const * c_const);
 
 const float PI_F = 3.14159265358979323846f;
-
-// --- SHARED STRUCTS (MUST MATCH GEODESIC.METAL) ---
-
-struct alignas(16) SimObject {
-    vec4 posRadius;
-    vec4 color;
-    float  mass;
-    float  _pad0[3];
-    vec4 velocity;
-};
-
-struct alignas(16) CameraData {
-    vec4 camPos;
-    vec4 camRight;
-    vec4 camUp;
-    vec4 camForward;
-    float  tanHalfFov;
-    float  aspect;
-    int    moving;
-    int    _pad4;
-};
-
-struct alignas(16) SystemUniforms {
-    float time;
-    float spin;
-    float star_scint;
-    float nebula_int;
-    float charge;
-    float dt_sim;
-    float bloom_threshold;
-    float flare_int;
-    float motion_blur;
-    float film_grain;
-    float disk_density;
-    float disk_height;
-    float shadow_int;
-    float gw_amp;
-    float _pad[2];
-};
-
-struct alignas(16) ObjectsUniform {
-    int count;
-};
-
-struct alignas(16) GridUniforms {
-    mat4 viewProj;
-};
 
 // --- GLOBALS ---
 
@@ -96,31 +52,11 @@ float diskDensity = 0.45f;
 float diskHeight = 0.6f;
 float shadowIntensity = 0.5f;
 float gwAmplitude = 0.5f;
+double lastFrameTime = 0.0;
+float deltaTime = 0.016f;
 
-struct Camera {
-  vec3 target = vec3(0.0f);
-  float radius = (float)(SagA_rs * 20.0);
-  float azimuth = 0.5f;
-  float elevation = 0.4f;
-  bool dragging = false;
-  bool panning = false;
-  double lastX = 0.0;
-  double lastY = 0.0;
-
-  vec3 position() const {
-    float clampedEl = std::max(0.05f, std::min(elevation, PI_F - 0.05f));
-    vec3 offset(radius * sin(clampedEl) * cos(azimuth), radius * cos(clampedEl),
-                radius * sin(clampedEl) * sin(azimuth));
-    return target + offset;
-  }
-
-  mat4 getViewProj() const {
-    float aspect = float(WINDOW_WIDTH) / float(WINDOW_HEIGHT);
-    mat4 proj = perspective(radians(60.0f), aspect, 1e9f, 5e13f);
-    mat4 view = lookAt(position(), target, vec3(0, 1, 0));
-    return proj * view;
-  }
-} camera;
+#include "Camera.h"
+Camera camera((float)(SagA_rs * 20.0));
 
 class GridRenderer {
 public:
@@ -194,26 +130,28 @@ public:
   id<MTLComputePipelineState> postPSO;
 
   id<MTLBuffer> camBuffer[3];
-  id<MTLBuffer> objBuffer[3];
+  id<MTLBuffer> objBuffer;          // Single buffer — GPU-only writes, no triple-buffering needed
   id<MTLBuffer> objUniformBuffer[3];
   id<MTLBuffer> sysUniformBuffer[3];
   id<MTLBuffer> gridUniformBuffer[3];
   int currentFrame = 0;
 
   id<MTLTexture> fluidTex[2];
-  id<MTLTexture> intermediateTex;
-  id<MTLTexture> accumTex;
+  id<MTLTexture> intermediateTex[2];  // Double-buffered: eliminates blit copy
   id<MTLTexture> depthTexture;
   int currentFluidIdx = 0;
+  int currentIntermIdx = 0;
 
   CAMetalLayer *metalLayer;
   GridRenderer *gridRenderer;
 
   int drawableW, drawableH;
   GLFWwindow* winRef;
+  dispatch_semaphore_t frameSemaphore;
 
   MetalEngine(GLFWwindow *window, const vector<SimObject> &initialObjects) {
     winRef = window;
+    frameSemaphore = dispatch_semaphore_create(3);
     device = MTLCreateSystemDefaultDevice();
     commandQueue = [device newCommandQueue];
 
@@ -230,16 +168,34 @@ public:
     [view setWantsLayer:YES];
 
     NSError *err = nil;
-    NSString *src = [NSString stringWithContentsOfFile:@"geodesic.metal" encoding:NSUTF8StringEncoding error:&err];
-    id<MTLLibrary> lib = [device newLibraryWithSource:src options:nil error:&err];
+    NSString *execDir = [[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent];
+    NSString *headerPath = [execDir stringByAppendingPathComponent:@"ShaderCommon.h"];
+    NSString *shaderPath = [execDir stringByAppendingPathComponent:@"geodesic.metal"];
+
+    NSString *headerSrc = [NSString stringWithContentsOfFile:headerPath encoding:NSUTF8StringEncoding error:&err];
+    if (!headerSrc) { std::cerr << "Cannot load ShaderCommon.h: " << err.localizedDescription.UTF8String << std::endl; exit(1); }
+    NSString *shaderSrc = [NSString stringWithContentsOfFile:shaderPath encoding:NSUTF8StringEncoding error:&err];
+    if (!shaderSrc) { std::cerr << "Cannot load geodesic.metal: " << err.localizedDescription.UTF8String << std::endl; exit(1); }
+
+    NSString *fullSrc = [NSString stringWithFormat:@"%@\n%@", headerSrc, shaderSrc];
+    MTLCompileOptions *compileOpts = [[MTLCompileOptions alloc] init];
+    // INVARIANT: Must use MTLMathModeRelaxed, NOT MTLMathModeFast.
+    // Fast math uses approximate sqrt/division which corrupts geodesic
+    // integration, causing the accretion disk to disappear at edge-on angles.
+    compileOpts.mathMode = MTLMathModeRelaxed;
+    compileOpts.languageVersion = MTLLanguageVersion3_0;
+    id<MTLLibrary> lib = [device newLibraryWithSource:fullSrc options:compileOpts error:&err];
     if (!lib) { std::cerr << "Metal Library Error: " << err.localizedDescription.UTF8String << std::endl; exit(1); }
 
     auto createPSO = [&](const char* name) {
-        id<MTLFunction> func = [lib newFunctionWithName:[NSString stringWithUTF8String:name]];
-        if (!func) { std::cerr << "Metal Function Not Found: " << name << std::endl; exit(1); }
-        id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&err];
-        if (!pso) { std::cerr << "PSO Creation Error for " << name << ": " << err.localizedDescription.UTF8String << std::endl; exit(1); }
-        return pso;
+      id<MTLFunction> func = [lib newFunctionWithName:[NSString stringWithUTF8String:name]];
+      if (!func) { std::cerr << "Metal Function Not Found: " << name << std::endl; exit(1); }
+      MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
+      desc.computeFunction = func;
+      desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+      id<MTLComputePipelineState> pso = [device newComputePipelineStateWithDescriptor:desc options:0 reflection:nil error:&err];
+      if (!pso) { std::cerr << "PSO Creation Error for " << name << ": " << err.localizedDescription.UTF8String << std::endl; exit(1); }
+      return pso;
     };
 
     raytracePSO = createPSO("raytrace");
@@ -249,9 +205,11 @@ public:
 
     gridRenderer = new GridRenderer(device, lib);
 
+    // Object buffer is single (GPU physics writes; no CPU mutation after init)
+    objBuffer = [device newBufferWithBytes:initialObjects.data() length:sizeof(SimObject) * initialObjects.size() options:MTLResourceStorageModeShared];
+
     for (int i = 0; i < 3; i++) {
       camBuffer[i] = [device newBufferWithLength:sizeof(CameraData) options:MTLResourceStorageModeShared];
-      objBuffer[i] = [device newBufferWithBytes:initialObjects.data() length:sizeof(SimObject) * initialObjects.size() options:MTLResourceStorageModeShared];
       objUniformBuffer[i] = [device newBufferWithLength:sizeof(ObjectsUniform) options:MTLResourceStorageModeShared];
       sysUniformBuffer[i] = [device newBufferWithLength:sizeof(SystemUniforms) options:MTLResourceStorageModeShared];
       gridUniformBuffer[i] = [device newBufferWithLength:sizeof(GridUniforms) options:MTLResourceStorageModeShared];
@@ -266,7 +224,7 @@ public:
   }
 
   void createResources() {
-    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:2048 height:2048 mipmapped:NO];
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:1024 height:1024 mipmapped:NO];
     td.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModePrivate;
     fluidTex[0] = [device newTextureWithDescriptor:td];
@@ -275,8 +233,8 @@ public:
     MTLTextureDescriptor *itd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:drawableW height:drawableH mipmapped:NO];
     itd.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
     itd.storageMode = MTLStorageModePrivate;
-    intermediateTex = [device newTextureWithDescriptor:itd];
-    accumTex = [device newTextureWithDescriptor:itd]; 
+    intermediateTex[0] = [device newTextureWithDescriptor:itd];
+    intermediateTex[1] = [device newTextureWithDescriptor:itd]; 
 
     MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:drawableW height:drawableH mipmapped:NO];
     dd.usage = MTLTextureUsageRenderTarget;
@@ -285,13 +243,19 @@ public:
   }
 
   void render(int activeObjectCount) {
+    dispatch_semaphore_wait(frameSemaphore, DISPATCH_TIME_FOREVER);
+
     int curW, curH;
     glfwGetFramebufferSize(winRef, &curW, &curH);
     if (curW != drawableW || curH != drawableH) {
       resize(curW, curH);
     }
 
-    simulationTime += 0.016f * timeScale;
+    // FPS-independent timing
+    double now = glfwGetTime();
+    deltaTime = std::clamp(float(now - lastFrameTime), 0.0001f, 0.1f);  // cap at 100ms
+    lastFrameTime = now;
+    simulationTime += deltaTime * timeScale;
     currentFrame = (currentFrame + 1) % 3;
 
     CameraData *cPtr = (CameraData *)camBuffer[currentFrame].contents;
@@ -299,26 +263,30 @@ public:
     vec3 fwd = normalize(camera.target - camPos);
     vec3 right = normalize(cross(fwd, vec3(0, 1, 0)));
     vec3 up = cross(right, fwd);
-    cPtr->camPos = vec4(camPos, 0.0f); cPtr->camRight = vec4(right, 0.0f); cPtr->camUp = vec4(up, 0.0f);
-    cPtr->camForward = vec4(fwd, 0.0f); cPtr->tanHalfFov = tan(radians(30.0f));
+    cPtr->camPos = glm::vec4(camPos, 0.0f); cPtr->camRight = glm::vec4(right, 0.0f); cPtr->camUp = glm::vec4(up, 0.0f);
+    cPtr->camForward = glm::vec4(fwd, 0.0f); cPtr->tanHalfFov = tan(radians(30.0f));
     cPtr->aspect = float(drawableW) / float(drawableH);
 
     ObjectsUniform *ouPtr = (ObjectsUniform *)objUniformBuffer[currentFrame].contents; ouPtr->count = activeObjectCount;
     SystemUniforms *sysPtr = (SystemUniforms *)sysUniformBuffer[currentFrame].contents;
-    sysPtr->time = simulationTime; sysPtr->spin = blackHoleSpin;
-    sysPtr->star_scint = starScintillation; sysPtr->nebula_int = nebulaIntensity;
-    sysPtr->charge = blackHoleCharge; sysPtr->dt_sim = 0.016f * timeScale;
-    sysPtr->bloom_threshold = bloomThreshold; sysPtr->flare_int = flareIntensity;
-    sysPtr->motion_blur = motionBlur; sysPtr->film_grain = filmGrain;
-    sysPtr->disk_density = diskDensity; sysPtr->disk_height = diskHeight;
-    sysPtr->shadow_int = shadowIntensity; sysPtr->gw_amp = gwAmplitude;
+    // SEC-04: Clamp all values to valid ranges at the GPU write site
+    sysPtr->time = simulationTime; sysPtr->spin = std::clamp(blackHoleSpin, -1.0f, 1.0f);
+    sysPtr->star_scint = std::clamp(starScintillation, 0.0f, 1.0f); sysPtr->nebula_int = std::clamp(nebulaIntensity, 0.0f, 2.0f);
+    sysPtr->charge = std::clamp(blackHoleCharge, 0.0f, 1.0f); sysPtr->dt_sim = deltaTime * std::clamp(timeScale, 0.0f, 5.0f);
+    sysPtr->bloom_threshold = std::clamp(bloomThreshold, 0.0f, 1.0f); sysPtr->flare_int = std::clamp(flareIntensity, 0.0f, 2.0f);
+    sysPtr->motion_blur = std::clamp(motionBlur, 0.0f, 0.99f); sysPtr->film_grain = std::clamp(filmGrain, 0.0f, 0.1f);
+    sysPtr->disk_density = std::clamp(diskDensity, 0.0f, 1.0f); sysPtr->disk_height = std::clamp(diskHeight, 0.1f, 2.0f);
+    sysPtr->shadow_int = std::clamp(shadowIntensity, 0.0f, 1.0f); sysPtr->gw_amp = std::clamp(gwAmplitude, 0.0f, 2.0f);
 
     GridUniforms *gPtr = (GridUniforms *)gridUniformBuffer[currentFrame].contents;
-    gPtr->viewProj = camera.getViewProj();
+    gPtr->viewProj = camera.getViewProj(float(drawableW) / float(drawableH));
 
     @autoreleasepool {
       id<CAMetalDrawable> drawable = [metalLayer nextDrawable];
-      if (!drawable) return;
+      if (!drawable) {
+        dispatch_semaphore_signal(frameSemaphore);
+        return;
+      }
 
       id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
 
@@ -328,7 +296,7 @@ public:
       [fluid setTexture:fluidTex[currentFluidIdx] atIndex:0];
       [fluid setTexture:fluidTex[1 - currentFluidIdx] atIndex:1];
       [fluid setBuffer:sysUniformBuffer[currentFrame] offset:0 atIndex:0];
-      [fluid dispatchThreadgroups:MTLSizeMake(128, 128, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+      [fluid dispatchThreads:MTLSizeMake(1024, 1024, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
       [fluid endEncoding];
       currentFluidIdx = 1 - currentFluidIdx;
 
@@ -336,41 +304,41 @@ public:
       if (Gravity) {
         id<MTLComputeCommandEncoder> phys = [cmd computeCommandEncoder];
         [phys setComputePipelineState:physicsPSO];
-        [phys setBuffer:objBuffer[currentFrame] offset:0 atIndex:0];
+        [phys setBuffer:objBuffer offset:0 atIndex:0];
         [phys setBuffer:objUniformBuffer[currentFrame] offset:0 atIndex:1];
-        [phys dispatchThreadgroups:MTLSizeMake((activeObjectCount+31)/32, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [phys setBuffer:sysUniformBuffer[currentFrame] offset:0 atIndex:2];
+        [phys dispatchThreads:MTLSizeMake(activeObjectCount, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [phys endEncoding];
       }
 
-      // 3. Quantum Gargantua Raytrace
-      MTLSize threads = MTLSizeMake(16, 16, 1);
-      MTLSize groups = MTLSizeMake((drawableW + 15) / 16, (drawableH + 15) / 16, 1);
+      // 3. Geodesic Raytrace
+      MTLSize tpg = MTLSizeMake(32, 8, 1);
+      int curInterm = currentIntermIdx;
+      int prevInterm = 1 - currentIntermIdx;
 
       id<MTLComputeCommandEncoder> ray = [cmd computeCommandEncoder];
       [ray setComputePipelineState:raytracePSO];
-      [ray setTexture:intermediateTex atIndex:0];
+      [ray setTexture:intermediateTex[curInterm] atIndex:0];
       [ray setTexture:fluidTex[currentFluidIdx] atIndex:1];
       [ray setBuffer:camBuffer[currentFrame] offset:0 atIndex:0];
-      [ray setBuffer:objBuffer[currentFrame] offset:0 atIndex:1];
+      [ray setBuffer:objBuffer offset:0 atIndex:1];
       [ray setBuffer:objUniformBuffer[currentFrame] offset:0 atIndex:2];
       [ray setBuffer:sysUniformBuffer[currentFrame] offset:0 atIndex:3];
-      [ray dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+      [ray dispatchThreads:MTLSizeMake(drawableW, drawableH, 1) threadsPerThreadgroup:tpg];
       [ray endEncoding];
 
-      // 4. Cinematic Post-Processing
+      // 4. Cinematic Post-Processing (reads current + previous frame for motion blur)
       id<MTLComputeCommandEncoder> post = [cmd computeCommandEncoder];
       [post setComputePipelineState:postPSO];
-      [post setTexture:intermediateTex atIndex:0];
-      [post setTexture:accumTex atIndex:1];
+      [post setTexture:intermediateTex[curInterm] atIndex:0];
+      [post setTexture:intermediateTex[prevInterm] atIndex:1];
       [post setTexture:drawable.texture atIndex:2];
       [post setBuffer:sysUniformBuffer[currentFrame] offset:0 atIndex:0];
-      [post dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+      [post dispatchThreads:MTLSizeMake(drawableW, drawableH, 1) threadsPerThreadgroup:tpg];
       [post endEncoding];
 
-      // Copy to Accumulation for Motion Blur
-      id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-      [blit copyFromTexture:intermediateTex toTexture:accumTex];
-      [blit endEncoding];
+      // Swap intermediate buffer index (no blit copy needed)
+      currentIntermIdx = 1 - currentIntermIdx;
 
       // 5. Grid Render Pass
       MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -387,7 +355,7 @@ public:
       [ren setDepthStencilState:gridRenderer->depthState];
       [ren setVertexBuffer:gridRenderer->vertexBuffer offset:0 atIndex:0];
       [ren setVertexBuffer:gridUniformBuffer[currentFrame] offset:0 atIndex:1];
-      [ren setVertexBuffer:objBuffer[currentFrame] offset:0 atIndex:2];
+      [ren setVertexBuffer:objBuffer offset:0 atIndex:2];
       [ren setVertexBuffer:objUniformBuffer[currentFrame] offset:0 atIndex:3];
       [ren setVertexBuffer:sysUniformBuffer[currentFrame] offset:0 atIndex:4];
       [ren drawIndexedPrimitives:MTLPrimitiveTypeLine indexCount:gridRenderer->indexCount indexType:MTLIndexTypeUInt32 indexBuffer:gridRenderer->indexBuffer indexBufferOffset:0];
@@ -396,7 +364,7 @@ public:
       ImGui_ImplGlfw_NewFrame();
       ImGui::NewFrame();
       ImGui::SetNextWindowSize(ImVec2(350, 450), ImGuiCond_FirstUseEver);
-      ImGui::Begin("Quantum Gargantua Engine");
+      ImGui::Begin("Geodesic Engine");
       if (ImGui::CollapsingHeader("Physics Metrics", ImGuiTreeNodeFlags_DefaultOpen)) {
           ImGui::SliderFloat("Black Hole Spin (a)", &blackHoleSpin, -1.0f, 1.0f);
           ImGui::SliderFloat("Electric Charge (Q)", &blackHoleCharge, 0.0f, 1.0f);
@@ -427,6 +395,13 @@ public:
       [ren endEncoding];
 
       [cmd presentDrawable:drawable];
+
+      // Signal semaphore when GPU finishes this frame
+      dispatch_semaphore_t sem = frameSemaphore;
+      [cmd addCompletedHandler:^(id<MTLCommandBuffer> _) {
+          dispatch_semaphore_signal(sem);
+      }];
+
       [cmd commit];
     }
   }
@@ -434,6 +409,10 @@ public:
   void resize(int w, int h) {
     drawableW = w; drawableH = h;
     metalLayer.drawableSize = CGSizeMake(drawableW, drawableH);
+    // Release old textures before re-creating
+    intermediateTex[0] = nil;
+    intermediateTex[1] = nil;
+    depthTexture = nil;
     createResources();
   }
 };
@@ -449,7 +428,7 @@ void mouseCallback(GLFWwindow *w, int btn, int act, int mods) {
   }
 }
 
-void cursorCallback(GLFWwindow *w, double x, double y) {
+void cursorCallback(GLFWwindow * /*w*/, double x, double y) {
   if (ImGui::GetIO().WantCaptureMouse) return;
   float dx = float(x - camera.lastX); float dy = float(y - camera.lastY);
   camera.lastX = x; camera.lastY = y;
@@ -465,23 +444,67 @@ void cursorCallback(GLFWwindow *w, double x, double y) {
   }
 }
 
-void scrollCallback(GLFWwindow *w, double xoff, double yoff) {
+void scrollCallback(GLFWwindow * /*w*/, double /*xoff*/, double yoff) {
   if (ImGui::GetIO().WantCaptureMouse) return;
-  camera.radius -= float(yoff) * 5e11f;
+  camera.radius *= (1.0f - float(yoff) * 0.1f);
   if (camera.radius < (float)(SagA_rs * 2.5)) camera.radius = (float)(SagA_rs * 2.5);
+}
+
+void keyCallback(GLFWwindow *w, int key, int /*scancode*/, int action, int /*mods*/) {
+  if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) glfwSetWindowShouldClose(w, GLFW_TRUE);
 }
 
 int main() {
   if (!glfwInit()) return -1;
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
   GLFWwindow *window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Black Hole Simulation - Final Frontier", nullptr, nullptr);
+  if (!window) { std::cerr << "Failed to create GLFW window" << std::endl; glfwTerminate(); return 1; }  // SEC-06
   glfwSetMouseButtonCallback(window, mouseCallback);
   glfwSetCursorPosCallback(window, cursorCallback);
   glfwSetScrollCallback(window, scrollCallback);
+  glfwSetKeyCallback(window, keyCallback);
   vector<SimObject> objects;
-  objects.push_back({vec4(0, 0, 8.0e12f, 1.2e12f), vec4(1, 0.8, 0.3, 1), 2.9e30f, {0,0,0}, vec4(1e7, 0, 0, 0)});
-  objects.push_back({vec4(0, 0, -8.0e12f, 1.2e12f), vec4(0.4, 0.7, 1, 1), 2.9e30f, {0,0,0}, vec4(-1e7, 0, 0, 0)});
-  objects.push_back({vec4(0, 0, 0, (float)SagA_rs), vec4(0,0,0,1), (float)8.5e36, {0,0,0}, vec4(0,0,0,0)});
+  const float GM = (float)(G_const * 8.5e36);
+
+  // --- Black Hole ---
+  SimObject bh = {}; bh.posRadius = vec4(0, 0, 0, (float)SagA_rs); bh.color = vec4(0,0,0,1); bh.mass = (float)8.5e36; bh.velocity = vec4(0,0,0,0);
+
+  // Close binary pair (existing)
+  SimObject s1 = {}; s1.posRadius = vec4(0, 0, 8.0e12f, 1.2e12f); s1.color = vec4(1.0f, 0.8f, 0.3f, 1); s1.mass = 2.9e30f;
+  s1.velocity = vec4(sqrt(GM / 8.0e12f), 0, 0, 0);
+  SimObject s2 = {}; s2.posRadius = vec4(0, 0, -8.0e12f, 1.2e12f); s2.color = vec4(0.4f, 0.7f, 1.0f, 1); s2.mass = 2.9e30f;
+  s2.velocity = vec4(-sqrt(GM / 8.0e12f), 0, 0, 0);
+
+  // Distant stars — gravitationally lensed via exit-direction check
+  // Blue giant behind BH
+  float r4 = 80.0e12f; float v4 = sqrt(GM / r4);
+  SimObject s4 = {}; s4.posRadius = vec4(r4, 0, 0, 3.0e12f); s4.color = vec4(0.5f, 0.7f, 1.0f, 1); s4.mass = 12.0e30f;
+  s4.velocity = vec4(0, 0, v4, 0);
+
+  // Red giant, opposite side
+  float r5 = 120.0e12f; float v5 = sqrt(GM / r5);
+  SimObject s5 = {}; s5.posRadius = vec4(-r5 * 0.7f, 5.0e12f, r5 * 0.7f, 4.0e12f); s5.color = vec4(1.0f, 0.4f, 0.15f, 1); s5.mass = 5.0e30f;
+  s5.velocity = vec4(-v5 * 0.7f, 0, -v5 * 0.7f, 0);
+
+  // White-blue star, high inclination
+  float r6 = 60.0e12f; float v6 = sqrt(GM / r6);
+  SimObject s6 = {}; s6.posRadius = vec4(0, 15.0e12f, -r6, 2.0e12f); s6.color = vec4(0.85f, 0.9f, 1.0f, 1); s6.mass = 6.0e30f;
+  s6.velocity = vec4(v6, 0, 0, 0);
+
+  // Orange star, far orbit
+  float r7 = 150.0e12f; float v7 = sqrt(GM / r7);
+  SimObject s7 = {}; s7.posRadius = vec4(r7 * 0.5f, 0, r7 * 0.866f, 3.5e12f); s7.color = vec4(1.0f, 0.6f, 0.2f, 1); s7.mass = 4.0e30f;
+  s7.velocity = vec4(-v7 * 0.866f, 0, v7 * 0.5f, 0);
+
+  // Violet star
+  float r8 = 100.0e12f; float v8 = sqrt(GM / r8);
+  SimObject s8 = {}; s8.posRadius = vec4(-r8, 0, 0, 2.5e12f); s8.color = vec4(0.7f, 0.4f, 1.0f, 1); s8.mass = 7.0e30f;
+  s8.velocity = vec4(0, 0, v8, 0);
+
+  objects.push_back(s1); objects.push_back(s2);
+  objects.push_back(s4); objects.push_back(s5); objects.push_back(s6);
+  objects.push_back(s7); objects.push_back(s8);
+  objects.push_back(bh);
   MetalEngine engine(window, objects);
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
