@@ -1,6 +1,7 @@
 # Metal Blackhole
 
 A high-fidelity, real-time black hole simulation optimized for Apple Silicon via the Metal API. This project implements general relativity geodesics, volumetric plasma physics, and cinematic post-processing to create a physically authentic and visually stunning representation of a Kerr-Newman black hole.
+<img width="1770" height="1263" alt="Metal-BlackHole_Screen_Shot" src="https://github.com/user-attachments/assets/98787b99-b1b8-4cc2-af2b-103536b6ee38" />
 
 ## Technical Highlights
 
