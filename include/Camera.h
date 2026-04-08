@@ -27,7 +27,7 @@ struct Camera {
   }
 
   glm::mat4 getViewProj(float aspect) const {
-    glm::mat4 proj = glm::perspective(glm::radians(60.0f), aspect, 1e9f, 5e13f);
+    glm::mat4 proj = glm::infinitePerspective(glm::radians(60.0f), aspect, 1e9f);
     glm::mat4 view = glm::lookAt(position(), target, glm::vec3(0, 1, 0));
     return proj * view;
   }

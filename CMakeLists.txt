@@ -50,7 +50,16 @@ target_compile_options(MetalBlackhole PRIVATE
     -fstack-protector-strong
 )
 
-# Shader copying (runtime compilation — see README Security section for metallib migration)
+# Precompile shaders to .metallib (faster startup, no GPU code injection risk)
+add_custom_command(TARGET MetalBlackhole POST_BUILD
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_metallib.sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/ShaderCommon.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/geodesic.metal
+        $<TARGET_FILE_DIR:MetalBlackhole>
+    COMMENT "Compiling Metal shaders to geodesic.metallib"
+)
+
+# Also copy source files as fallback for development/debugging
 add_custom_command(TARGET MetalBlackhole POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/geodesic.metal

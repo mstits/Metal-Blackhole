@@ -13,6 +13,8 @@ bin/
 # IDEs
 .vscode/
 .DS_Store
+*.swp
+*~
 
 # CMake
 CMakeCache.txt
@@ -21,3 +23,14 @@ CMakeScripts/
 cmake_install.cmake
 Makefile
 install_manifest.txt
+compile_commands.json
+_deps/
+
+# Runtime
+imgui.ini
+
+# Debug scripts (keep tests/, exclude one-off debug)
+debug_ray.py
+
+# Debug symbols
+*.dSYM/

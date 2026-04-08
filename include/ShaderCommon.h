@@ -48,7 +48,8 @@ struct SystemUniforms {
     float disk_height;
     float shadow_int;
     float gw_amp;
-    float _pad[2]; // Ensure 16-byte alignment
+    float exposure;
+    float jet_int;
 };
 
 struct ObjectsUniform {
