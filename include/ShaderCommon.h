@@ -50,10 +50,16 @@ struct SystemUniforms {
     float gw_amp;
     float exposure;
     float jet_int;
+    float r_horizon;        // Kerr event horizon (rs units), CPU-precomputed from spin
+    float r_isco;           // Kerr ISCO prograde (rs units), CPU-precomputed from spin
+    int   enable_bloom;     // 0 = bloom pipeline contributes nothing; 1 = active
+    int   _pad_sys;
 };
 
 struct ObjectsUniform {
     int count;
+    int bh_index;           // Index into objects[] of the black hole; -1 if absent
+    int _pad_obj[2];
 };
 
 struct GridUniforms {
