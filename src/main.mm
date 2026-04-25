@@ -17,7 +17,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <memory>
 #include <vector>
 
 using namespace glm;
@@ -35,45 +37,68 @@ const double SagA_rs = 2.0 * G_const * 8.54e36 / (c_const * c_const);
 
 const float PI_F = 3.14159265358979323846f;
 
-// --- GLOBALS ---
+// --- USER-FACING SETTINGS ---
+// All sliders / toggles driven from the ImGui panel. Defaults boot the app
+// in "physics-first" mode: Schwarzschild geometry, cinematic effects off.
+struct SimSettings {
+  bool  Gravity            = true;
+  float blackHoleSpin      = 0.0f;
+  float blackHoleCharge    = 0.0f;
+  float timeScale          = 1.0f;
+  float starScintillation  = 0.5f;
+  float nebulaIntensity    = 1.0f;
+  float bloomThreshold     = 0.85f;
+  float flareIntensity     = 0.5f;
+  float motionBlur         = 0.85f;
+  float filmGrain          = 0.02f;
+  float diskDensity        = 0.45f;
+  float diskHeight         = 0.6f;
+  float shadowIntensity    = 0.5f;
+  float gwAmplitude        = 0.5f;
+  float jetIntensity       = 0.7f;
 
-bool Gravity = true;
-float blackHoleSpin = 0.0f;       // Start Schwarzschild (simplest GR prediction)
-float blackHoleCharge = 0.0f;
+  bool enCharge        = false;
+  bool enDisk          = true;
+  bool enShadow        = true;
+  bool enGW            = true;
+  bool enJets          = false;
+  bool enNebula        = false;
+  bool enScintillation = false;
+  bool enBloom         = false;
+  bool enFlare         = false;
+  bool enMotionBlur    = false;
+  bool enFilmGrain     = false;
+  bool enVignette      = false;
+};
+static SimSettings g_sim;
+
+// --- RUNTIME STATE ---
 float simulationTime = 0.0f;
-float timeScale = 1.0f;
-float starScintillation = 0.5f;
-float nebulaIntensity = 1.0f;
-float bloomThreshold = 0.85f;
-float flareIntensity = 0.5f;
-float motionBlur = 0.85f;
-float filmGrain = 0.02f;
-float diskDensity = 0.45f;
-float diskHeight = 0.6f;
-float shadowIntensity = 0.5f;
-float gwAmplitude = 0.5f;
-float jetIntensity = 0.7f;
 double lastFrameTime = 0.0;
 float deltaTime = 0.016f;
 int frameCount = 0;
 bool screenshotPending = false;
 
-// Feature toggles — physics mode by default (cinematic effects OFF)
-bool enCharge = false;        // Off: start with pure Schwarzschild
-bool enDisk = true;           // On: essential for seeing BH effects
-bool enShadow = true;         // On: physical self-shadowing
-bool enGW = true;             // On: educational (spacetime curvature)
-bool enJets = false;          // Off: astrophysical, not fundamental GR
-bool enNebula = false;        // Off: visual distraction
-bool enScintillation = false; // Off: not GR physics
-bool enBloom = false;         // Off: cinematic
-bool enFlare = false;         // Off: cinematic
-bool enMotionBlur = false;    // Off: cinematic
-bool enFilmGrain = false;     // Off: cinematic
-bool enVignette = false;      // Off: cinematic
-
 #include "Camera.h"
 Camera camera((float)(SagA_rs * 20.0));
+
+// Spin-dependent Kerr radii in rs units. Computed once per frame on the CPU
+// and uploaded via SystemUniforms so the raytrace kernel does not redo this
+// algebra for every pixel.
+struct KerrRadii { float r_horizon, r_isco, r_photon; };
+
+static KerrRadii kerr_radii(float spin) {
+  float a = std::abs(spin);
+  float a2 = a * a;
+  float r_h = (1.0f + std::sqrt(std::max(1.0f - a2, 0.0f))) * 0.5f;
+  float cbrt_1ma2 = std::pow(std::max(1.0f - a2, 1e-6f), 1.0f / 3.0f);
+  float Z1 = 1.0f + cbrt_1ma2 * (std::pow(1.0f + a, 1.0f / 3.0f)
+                               + std::pow(std::max(1.0f - a, 1e-6f), 1.0f / 3.0f));
+  float Z2 = std::sqrt(3.0f * a2 + Z1 * Z1);
+  float r_isco = (3.0f + Z2 - std::sqrt(std::max((3.0f - Z1) * (3.0f + Z1 + 2.0f * Z2), 0.0f))) * 0.5f;
+  float r_photon = 1.0f + std::cos(2.0f / 3.0f * std::acos(-a));
+  return { r_h, r_isco, r_photon };
+}
 
 class GridRenderer {
 public:
@@ -168,7 +193,8 @@ public:
   MPSImageGaussianBlur *mpsBloom;
 
   CAMetalLayer *metalLayer;
-  GridRenderer *gridRenderer;
+  std::unique_ptr<GridRenderer> gridRenderer;
+  int bhIndex = -1;     // Index of the black hole in the SimObject array
 
   int drawableW, drawableH;
   GLFWwindow* winRef;
@@ -241,11 +267,21 @@ public:
     bloomExtractPSO = createPSO("bloom_extract");
     lumReducePSO = createPSO("luminance_reduce");
 
-    gridRenderer = new GridRenderer(device, lib);
+    gridRenderer = std::make_unique<GridRenderer>(device, lib);
     mpsBloom = [[MPSImageGaussianBlur alloc] initWithDevice:device sigma:8.0f];
 
     // Object buffer is single (GPU physics writes; no CPU mutation after init)
     objBuffer = [device newBufferWithBytes:initialObjects.data() length:sizeof(SimObject) * initialObjects.size() options:MTLResourceStorageModeShared];
+
+    // Locate the black hole once. Its identity never changes at runtime, so
+    // both the raytrace kernel and the host-side readout reuse this index.
+    for (size_t i = 0; i < initialObjects.size(); i++) {
+      if (initialObjects[i].mass > 1e35f) { bhIndex = (int)i; break; }
+    }
+    if (bhIndex < 0) {
+      std::cerr << "Fatal: no black hole (mass > 1e35) in initial object set" << std::endl;
+      exit(1);
+    }
 
     for (int i = 0; i < 3; i++) {
       camBuffer[i] = [device newBufferWithLength:sizeof(CameraData) options:MTLResourceStorageModeShared];
@@ -305,7 +341,7 @@ public:
     double now = glfwGetTime();
     deltaTime = std::clamp(float(now - lastFrameTime), 0.0001f, 0.1f);  // cap at 100ms
     lastFrameTime = now;
-    simulationTime += deltaTime * timeScale;
+    simulationTime += deltaTime * g_sim.timeScale;
     currentFrame = (currentFrame + 1) % 3;
     frameCount++;
 
@@ -318,32 +354,48 @@ public:
     cPtr->camForward = glm::vec4(fwd, 0.0f); cPtr->tanHalfFov = tan(radians(30.0f));
     cPtr->aspect = float(drawableW) / float(drawableH);
 
-    ObjectsUniform *ouPtr = (ObjectsUniform *)objUniformBuffer[currentFrame].contents; ouPtr->count = activeObjectCount;
-    SystemUniforms *sysPtr = (SystemUniforms *)sysUniformBuffer[currentFrame].contents;
-    // SEC-04: Clamp all values to valid ranges at the GPU write site
-    // Feature toggles: send 0 when disabled, preserving slider value for re-enable
-    sysPtr->time = simulationTime; sysPtr->spin = std::clamp(blackHoleSpin, -1.0f, 1.0f);
-    sysPtr->star_scint = enScintillation ? std::clamp(starScintillation, 0.0f, 1.0f) : 0.0f;
-    sysPtr->nebula_int = enNebula ? std::clamp(nebulaIntensity, 0.0f, 2.0f) : 0.0f;
-    sysPtr->charge = enCharge ? std::clamp(blackHoleCharge, 0.0f, 1.0f) : 0.0f;
-    sysPtr->dt_sim = deltaTime * std::clamp(timeScale, 0.0f, 5.0f);
-    sysPtr->bloom_threshold = enBloom ? std::clamp(bloomThreshold, 0.0f, 1.0f) : 999.0f;  // 999 = nothing passes when disabled
-    sysPtr->flare_int = enFlare ? std::clamp(flareIntensity, 0.0f, 2.0f) : 0.0f;
-    sysPtr->motion_blur = enMotionBlur ? std::clamp(motionBlur, 0.0f, 0.99f) : 0.0f;
-    sysPtr->film_grain = enFilmGrain ? std::clamp(filmGrain, 0.0f, 0.1f) : 0.0f;
-    sysPtr->disk_density = enDisk ? std::clamp(diskDensity, 0.0f, 1.0f) : 0.0f;
-    sysPtr->disk_height = std::clamp(diskHeight, 0.1f, 2.0f);
-    sysPtr->shadow_int = enShadow ? std::clamp(shadowIntensity, 0.0f, 1.0f) : 0.0f;
-    sysPtr->gw_amp = enGW ? std::clamp(gwAmplitude, 0.0f, 2.0f) : 0.0f;
-    sysPtr->jet_int = enJets ? std::clamp(jetIntensity, 0.0f, 2.0f) : 0.0f;
+    ObjectsUniform *ouPtr = (ObjectsUniform *)objUniformBuffer[currentFrame].contents;
+    ouPtr->count = activeObjectCount;
+    ouPtr->bh_index = bhIndex;
 
-    // Auto-exposure: read luminance data from 2 frames ago (guaranteed complete)
+    KerrRadii kr = kerr_radii(g_sim.blackHoleSpin);
+
+    SystemUniforms *sysPtr = (SystemUniforms *)sysUniformBuffer[currentFrame].contents;
+    // Clamp all values to valid ranges at the GPU write site to prevent NaN
+    // propagation, division-by-zero, or out-of-range parameters from reaching
+    // the GPU. Disabled features write 0 so the shader is purely an additive
+    // pipeline with no per-feature branching needed.
+    sysPtr->time = simulationTime;
+    sysPtr->spin = std::clamp(g_sim.blackHoleSpin, -1.0f, 1.0f);
+    sysPtr->star_scint   = g_sim.enScintillation ? std::clamp(g_sim.starScintillation, 0.0f, 1.0f) : 0.0f;
+    sysPtr->nebula_int   = g_sim.enNebula        ? std::clamp(g_sim.nebulaIntensity,   0.0f, 2.0f) : 0.0f;
+    sysPtr->charge       = g_sim.enCharge        ? std::clamp(g_sim.blackHoleCharge,   0.0f, 1.0f) : 0.0f;
+    sysPtr->dt_sim       = deltaTime * std::clamp(g_sim.timeScale, 0.0f, 5.0f);
+    sysPtr->bloom_threshold = std::clamp(g_sim.bloomThreshold, 0.0f, 1.0f);
+    sysPtr->enable_bloom = g_sim.enBloom ? 1 : 0;
+    sysPtr->flare_int    = g_sim.enFlare      ? std::clamp(g_sim.flareIntensity, 0.0f, 2.0f)  : 0.0f;
+    sysPtr->motion_blur  = g_sim.enMotionBlur ? std::clamp(g_sim.motionBlur,     0.0f, 0.99f) : 0.0f;
+    sysPtr->film_grain   = g_sim.enFilmGrain  ? std::clamp(g_sim.filmGrain,      0.0f, 0.1f)  : 0.0f;
+    sysPtr->disk_density = g_sim.enDisk       ? std::clamp(g_sim.diskDensity,    0.0f, 1.0f)  : 0.0f;
+    sysPtr->disk_height  = std::clamp(g_sim.diskHeight, 0.1f, 2.0f);
+    sysPtr->shadow_int   = g_sim.enShadow ? std::clamp(g_sim.shadowIntensity, 0.0f, 1.0f) : 0.0f;
+    sysPtr->gw_amp       = g_sim.enGW     ? std::clamp(g_sim.gwAmplitude,     0.0f, 2.0f) : 0.0f;
+    sysPtr->jet_int      = g_sim.enJets   ? std::clamp(g_sim.jetIntensity,    0.0f, 2.0f) : 0.0f;
+    sysPtr->r_horizon    = kr.r_horizon;
+    sysPtr->r_isco       = kr.r_isco;
+
+    // Auto-exposure: sample luminance from a slot written 2 frames ago. With
+    // semaphore depth 3 this slot's GPU work may not be 100% complete (the
+    // semaphore only guarantees the slot N-3 has finished, not N-2), but the
+    // smoothing applied to currentExposure absorbs torn reads.
     int readFrame = (currentFrame + 1) % 3;
     uint32_t* lumData = (uint32_t*)lumBuffer[readFrame].contents;
     uint32_t sumEncoded = lumData[0];
     uint32_t pixCount = lumData[1];
     if (pixCount > 100) {
-      float avgLogLum = (float(sumEncoded) / float(pixCount)) / 1000.0f - 10.0f;
+      // Encoding in luminance_reduce uses ×100 fixed-point so the global sum
+      // stays under uint32_t at 4K resolution. Mirror that scale here.
+      float avgLogLum = (float(sumEncoded) / float(pixCount)) / 100.0f - 10.0f;
       float targetExposure = std::clamp(0.18f / exp2f(avgLogLum), 0.15f, 5.0f);
       currentExposure += (targetExposure - currentExposure) * std::min(deltaTime * 1.5f, 1.0f);
     }
@@ -374,7 +426,7 @@ public:
       currentFluidIdx = 1 - currentFluidIdx;
 
       // 2. N-Body Physics
-      if (Gravity) {
+      if (g_sim.Gravity) {
         id<MTLComputeCommandEncoder> phys = [cmd computeCommandEncoder];
         [phys setComputePipelineState:physicsPSO];
         [phys setBuffer:objBuffer offset:0 atIndex:0];
@@ -416,13 +468,17 @@ public:
       // 5. MPS Gaussian Blur (cinematic bloom)
       [mpsBloom encodeToCommandBuffer:cmd sourceTexture:bloomTex destinationTexture:bloomBlurTex];
 
-      // 6. Luminance Analysis (auto-exposure)
+      // 6. Luminance Analysis (auto-exposure). The kernel samples 1 pixel per
+      // 4×4 block, so dispatch at quarter resolution rather than full and
+      // early-returning on most threads.
       {
         id<MTLComputeCommandEncoder> lum = [cmd computeCommandEncoder];
         [lum setComputePipelineState:lumReducePSO];
         [lum setTexture:intermediateTex[curInterm] atIndex:0];
         [lum setBuffer:lumBuffer[currentFrame] offset:0 atIndex:0];
-        [lum dispatchThreads:MTLSizeMake(drawableW, drawableH, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        int lumW = (drawableW + 3) / 4;
+        int lumH = (drawableH + 3) / 4;
+        [lum dispatchThreads:MTLSizeMake(lumW, lumH, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
         [lum endEncoding];
       }
 
@@ -440,7 +496,7 @@ public:
       // Swap intermediate buffer index (no blit copy needed)
       currentIntermIdx = 1 - currentIntermIdx;
 
-      // 5. Grid Render Pass
+      // 8. Grid Render Pass (final pass: spacetime manifold + ImGui)
       MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
       rpd.colorAttachments[0].texture = drawable.texture;
       rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -472,108 +528,102 @@ public:
       if (ImGui::CollapsingHeader("Presets", ImGuiTreeNodeFlags_DefaultOpen)) {
           ImGui::TextWrapped("Quick configurations for common spacetime geometries.");
           if (ImGui::Button("Schwarzschild")) {
-              blackHoleSpin = 0.0f; blackHoleCharge = 0.0f;
-              enCharge = false; enJets = false;
-              enBloom = false; enFlare = false; enMotionBlur = false; enFilmGrain = false;
-              enNebula = false; enScintillation = false;
+              g_sim.blackHoleSpin = 0.0f; g_sim.blackHoleCharge = 0.0f;
+              g_sim.enCharge = false; g_sim.enJets = false;
+              g_sim.enBloom = false; g_sim.enFlare = false; g_sim.enMotionBlur = false; g_sim.enFilmGrain = false;
+              g_sim.enNebula = false; g_sim.enScintillation = false;
           }
           ImGui::SameLine();
           if (ImGui::Button("Kerr")) {
-              blackHoleSpin = 0.7f; blackHoleCharge = 0.0f;
-              enCharge = false; enJets = false;
-              enBloom = false; enFlare = false; enMotionBlur = false; enFilmGrain = false;
-              enNebula = false; enScintillation = false;
+              g_sim.blackHoleSpin = 0.7f; g_sim.blackHoleCharge = 0.0f;
+              g_sim.enCharge = false; g_sim.enJets = false;
+              g_sim.enBloom = false; g_sim.enFlare = false; g_sim.enMotionBlur = false; g_sim.enFilmGrain = false;
+              g_sim.enNebula = false; g_sim.enScintillation = false;
           }
           ImGui::SameLine();
           if (ImGui::Button("Extreme Kerr")) {
-              blackHoleSpin = 0.998f; blackHoleCharge = 0.0f;
-              enCharge = false; enJets = true;
-              enBloom = false; enFlare = false; enMotionBlur = false; enFilmGrain = false;
-              enNebula = false; enScintillation = false;
+              g_sim.blackHoleSpin = 0.998f; g_sim.blackHoleCharge = 0.0f;
+              g_sim.enCharge = false; g_sim.enJets = true;
+              g_sim.enBloom = false; g_sim.enFlare = false; g_sim.enMotionBlur = false; g_sim.enFilmGrain = false;
+              g_sim.enNebula = false; g_sim.enScintillation = false;
           }
           if (ImGui::Button("Charged (RN)")) {
-              blackHoleSpin = 0.0f; blackHoleCharge = 0.5f;
-              enCharge = true; enJets = false;
-              enBloom = false; enFlare = false; enMotionBlur = false; enFilmGrain = false;
-              enNebula = false; enScintillation = false;
+              g_sim.blackHoleSpin = 0.0f; g_sim.blackHoleCharge = 0.5f;
+              g_sim.enCharge = true; g_sim.enJets = false;
+              g_sim.enBloom = false; g_sim.enFlare = false; g_sim.enMotionBlur = false; g_sim.enFilmGrain = false;
+              g_sim.enNebula = false; g_sim.enScintillation = false;
           }
           ImGui::SameLine();
           if (ImGui::Button("Kerr-Newman")) {
-              blackHoleSpin = 0.6f; blackHoleCharge = 0.3f;
-              enCharge = true; enJets = true;
-              enBloom = false; enFlare = false; enMotionBlur = false; enFilmGrain = false;
-              enNebula = false; enScintillation = false;
+              g_sim.blackHoleSpin = 0.6f; g_sim.blackHoleCharge = 0.3f;
+              g_sim.enCharge = true; g_sim.enJets = true;
+              g_sim.enBloom = false; g_sim.enFlare = false; g_sim.enMotionBlur = false; g_sim.enFilmGrain = false;
+              g_sim.enNebula = false; g_sim.enScintillation = false;
           }
           ImGui::SameLine();
           if (ImGui::Button("Cinematic")) {
-              blackHoleSpin = 0.85f; blackHoleCharge = 0.0f;
-              enCharge = false; enJets = true;
-              enBloom = true; enFlare = true; enMotionBlur = true; enFilmGrain = true;
-              enNebula = true; enScintillation = true;
+              g_sim.blackHoleSpin = 0.85f; g_sim.blackHoleCharge = 0.0f;
+              g_sim.enCharge = false; g_sim.enJets = true;
+              g_sim.enBloom = true; g_sim.enFlare = true; g_sim.enMotionBlur = true; g_sim.enFilmGrain = true;
+              g_sim.enNebula = true; g_sim.enScintillation = true;
           }
       }
 
       // --- GENERAL RELATIVITY ---
       if (ImGui::CollapsingHeader("General Relativity", ImGuiTreeNodeFlags_DefaultOpen)) {
           ImGui::TextWrapped("Kerr-Newman metric parameters. Spin causes frame dragging; charge modifies the event horizon.");
-          ImGui::SliderFloat("Black Hole Spin (a)", &blackHoleSpin, -1.0f, 1.0f);
-          ImGui::SliderFloat("Electric Charge (Q)", &blackHoleCharge, 0.0f, 1.0f);
-          ImGui::SameLine(); ImGui::Checkbox("##enCharge", &enCharge);
-          ImGui::SliderFloat("Simulation Speed", &timeScale, 0.0f, 5.0f);
-          ImGui::Checkbox("N-Body Gravitation", &Gravity);
+          ImGui::SliderFloat("Black Hole Spin (a)", &g_sim.blackHoleSpin, -1.0f, 1.0f);
+          ImGui::SliderFloat("Electric Charge (Q)", &g_sim.blackHoleCharge, 0.0f, 1.0f);
+          ImGui::SameLine(); ImGui::Checkbox("##enCharge", &g_sim.enCharge);
+          ImGui::SliderFloat("Simulation Speed", &g_sim.timeScale, 0.0f, 5.0f);
+          ImGui::Checkbox("N-Body Gravitation", &g_sim.Gravity);
       }
 
       // --- ACCRETION PHYSICS ---
       if (ImGui::CollapsingHeader("Accretion Disk", ImGuiTreeNodeFlags_DefaultOpen)) {
           ImGui::TextWrapped("Novikov-Thorne thin disk. Temperature follows T ~ r^(-3/4). Inner edge at the ISCO.");
-          ImGui::SliderFloat("Plasma Density", &diskDensity, 0.0f, 1.0f);
-          ImGui::SameLine(); ImGui::Checkbox("##enDisk", &enDisk);
-          ImGui::SliderFloat("Torus Height", &diskHeight, 0.1f, 2.0f);
-          ImGui::SliderFloat("Shadow Depth", &shadowIntensity, 0.0f, 1.0f);
-          ImGui::SameLine(); ImGui::Checkbox("##enShadow", &enShadow);
+          ImGui::SliderFloat("Plasma Density", &g_sim.diskDensity, 0.0f, 1.0f);
+          ImGui::SameLine(); ImGui::Checkbox("##enDisk", &g_sim.enDisk);
+          ImGui::SliderFloat("Torus Height", &g_sim.diskHeight, 0.1f, 2.0f);
+          ImGui::SliderFloat("Shadow Depth", &g_sim.shadowIntensity, 0.0f, 1.0f);
+          ImGui::SameLine(); ImGui::Checkbox("##enShadow", &g_sim.enShadow);
       }
 
       // --- SPACETIME EFFECTS ---
       if (ImGui::CollapsingHeader("Spacetime Effects")) {
-          ImGui::SliderFloat("GW Amplitude", &gwAmplitude, 0.0f, 2.0f);
-          ImGui::SameLine(); ImGui::Checkbox("##enGW", &enGW);
-          ImGui::SliderFloat("Jet Intensity", &jetIntensity, 0.0f, 2.0f);
-          ImGui::SameLine(); ImGui::Checkbox("##enJets", &enJets);
+          ImGui::SliderFloat("GW Amplitude", &g_sim.gwAmplitude, 0.0f, 2.0f);
+          ImGui::SameLine(); ImGui::Checkbox("##enGW", &g_sim.enGW);
+          ImGui::SliderFloat("Jet Intensity", &g_sim.jetIntensity, 0.0f, 2.0f);
+          ImGui::SameLine(); ImGui::Checkbox("##enJets", &g_sim.enJets);
       }
 
       // --- CINEMATIC (collapsed by default — physics first) ---
       if (ImGui::CollapsingHeader("Cinematic Effects")) {
           ImGui::TextWrapped("Non-physical visual effects for cinematic rendering.");
-          ImGui::SliderFloat("Nebula Intensity", &nebulaIntensity, 0.0f, 2.0f);
-          ImGui::SameLine(); ImGui::Checkbox("##enNebula", &enNebula);
-          ImGui::SliderFloat("Star Scintillation", &starScintillation, 0.0f, 1.0f);
-          ImGui::SameLine(); ImGui::Checkbox("##enScint", &enScintillation);
-          ImGui::SliderFloat("Bloom Threshold", &bloomThreshold, 0.0f, 1.0f);
-          ImGui::SameLine(); ImGui::Checkbox("##enBloom", &enBloom);
-          ImGui::SliderFloat("Anamorphic Flare", &flareIntensity, 0.0f, 2.0f);
-          ImGui::SameLine(); ImGui::Checkbox("##enFlare", &enFlare);
-          ImGui::SliderFloat("Motion Blur", &motionBlur, 0.0f, 0.99f);
-          ImGui::SameLine(); ImGui::Checkbox("##enMBlur", &enMotionBlur);
-          ImGui::SliderFloat("Film Grain", &filmGrain, 0.0f, 0.1f);
-          ImGui::SameLine(); ImGui::Checkbox("##enGrain", &enFilmGrain);
+          ImGui::SliderFloat("Nebula Intensity", &g_sim.nebulaIntensity, 0.0f, 2.0f);
+          ImGui::SameLine(); ImGui::Checkbox("##enNebula", &g_sim.enNebula);
+          ImGui::SliderFloat("Star Scintillation", &g_sim.starScintillation, 0.0f, 1.0f);
+          ImGui::SameLine(); ImGui::Checkbox("##enScint", &g_sim.enScintillation);
+          ImGui::SliderFloat("Bloom Threshold", &g_sim.bloomThreshold, 0.0f, 1.0f);
+          ImGui::SameLine(); ImGui::Checkbox("##enBloom", &g_sim.enBloom);
+          ImGui::SliderFloat("Anamorphic Flare", &g_sim.flareIntensity, 0.0f, 2.0f);
+          ImGui::SameLine(); ImGui::Checkbox("##enFlare", &g_sim.enFlare);
+          ImGui::SliderFloat("Motion Blur", &g_sim.motionBlur, 0.0f, 0.99f);
+          ImGui::SameLine(); ImGui::Checkbox("##enMBlur", &g_sim.enMotionBlur);
+          ImGui::SliderFloat("Film Grain", &g_sim.filmGrain, 0.0f, 0.1f);
+          ImGui::SameLine(); ImGui::Checkbox("##enGrain", &g_sim.enFilmGrain);
       }
 
       ImGui::Separator();
-      // Kerr metric physics readouts (computed from spin)
+      // Kerr metric physics readouts — same algebra as the GPU uniform write,
+      // shared via kerr_radii() so there is one source of truth.
       {
-          float a = std::abs(blackHoleSpin);
-          float a2 = a * a;
-          float r_h = (1.0f + std::sqrt(std::max(1.0f - a2, 0.0f))) * 0.5f;
-          float cbrt = std::pow(std::max(1.0f - a2, 1e-6f), 1.0f/3.0f);
-          float Z1 = 1.0f + cbrt * (std::pow(1.0f + a, 1.0f/3.0f) + std::pow(std::max(1.0f - a, 1e-6f), 1.0f/3.0f));
-          float Z2 = std::sqrt(3.0f * a2 + Z1 * Z1);
-          float r_isco = (3.0f + Z2 - std::sqrt(std::max((3.0f - Z1) * (3.0f + Z1 + 2.0f * Z2), 0.0f))) * 0.5f;
-          float r_photon = (1.0f + std::cos(2.0f/3.0f * std::acos(-a)));
-          ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "Kerr Metric (a = %.3f)", blackHoleSpin);
-          ImGui::Text("  Event Horizon:   %.3f rs", r_h);
-          ImGui::Text("  Photon Sphere:   %.3f rs", r_photon);
-          ImGui::Text("  ISCO (prograde): %.3f rs", r_isco);
-          if (a > 0.01f) ImGui::Text("  Ergosphere:      1.000 rs");
+          KerrRadii kr_ui = kerr_radii(g_sim.blackHoleSpin);
+          ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "Kerr Metric (a = %.3f)", g_sim.blackHoleSpin);
+          ImGui::Text("  Event Horizon:   %.3f rs", kr_ui.r_horizon);
+          ImGui::Text("  Photon Sphere:   %.3f rs", kr_ui.r_photon);
+          ImGui::Text("  ISCO (prograde): %.3f rs", kr_ui.r_isco);
+          if (std::abs(g_sim.blackHoleSpin) > 0.01f) ImGui::Text("  Ergosphere:      1.000 rs");
       }
       ImGui::Separator();
       ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "Auto-Exposure: %.2f", currentExposure);
@@ -624,14 +674,19 @@ public:
           FILE *f = fopen(path, "wb");
           if (f) {
               fprintf(f, "P6\n%lu %lu\n255\n", w, h);
+              // BGRA → RGB into one heap buffer, then a single fwrite. Avoids
+              // millions of fputc calls and the per-call locking overhead.
+              std::vector<uint8_t> rgb(w * h * 3);
+              uint8_t *dst = rgb.data();
               for (NSUInteger y = 0; y < h; y++) {
+                  const uint8_t *row = data + y * bpr;
                   for (NSUInteger x = 0; x < w; x++) {
-                      size_t idx = y * bpr + x * 4;
-                      fputc(data[idx+2], f);  // BGRA → R
-                      fputc(data[idx+1], f);  // G
-                      fputc(data[idx+0], f);  // B
+                      *dst++ = row[x * 4 + 2];  // R
+                      *dst++ = row[x * 4 + 1];  // G
+                      *dst++ = row[x * 4 + 0];  // B
                   }
               }
+              fwrite(rgb.data(), 1, rgb.size(), f);
               fclose(f);
               printf("QA capture frame %d: %s (%lux%lu)\n", frameCount, path, w, h);
           } else {
@@ -696,7 +751,7 @@ int main() {
   if (!glfwInit()) return -1;
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
   GLFWwindow *window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Black Hole Simulation - Final Frontier", nullptr, nullptr);
-  if (!window) { std::cerr << "Failed to create GLFW window" << std::endl; glfwTerminate(); return 1; }  // SEC-06
+  if (!window) { std::cerr << "Failed to create GLFW window" << std::endl; glfwTerminate(); return 1; }
   glfwSetMouseButtonCallback(window, mouseCallback);
   glfwSetCursorPosCallback(window, cursorCallback);
   glfwSetScrollCallback(window, scrollCallback);

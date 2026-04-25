@@ -44,7 +44,7 @@ target_link_libraries(MetalBlackhole PRIVATE
     ${MPS_FRAMEWORK}
 )
 
-# Compiler hardening (SEC-07)
+# Compiler hardening
 target_compile_options(MetalBlackhole PRIVATE
     -Wall -Wextra -Wformat-security
     -fstack-protector-strong
