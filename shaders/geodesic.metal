@@ -4,7 +4,7 @@ using namespace metal;
 // Structs (SimObject, CameraData, SystemUniforms, ObjectsUniform, GridUniforms)
 // are provided by ShaderCommon.h, prepended at compile time.
 
-// --- HIGH-FIDELITY NOISE ENGINE ---
+// --- NOISE (background nebula + jets) ---
 
 static inline float hash13(float3 p3) {
     p3  = fract(p3 * 0.1031f);
@@ -28,186 +28,249 @@ static inline half noise_half(float3 x) {
                     mix(mix(h001, h101, f.x), mix(h011, h111, f.x), f.y), f.z);
 }
 
-static inline half fbm_half(float3 p, float t) {
-    half v = 0.0h;
-    half a = 0.5h;
-    [[unroll]]
-    for (int i=0; i<5; i++) {
-        v += a * noise_half(p + t * 0.3f);
-        p = p * 2.02f + float3(10.0f);
-        a *= 0.5h;
-    }
-    return v;
+// --- BLACKBODY COLOR ---
+// Luminance-normalized linear-sRGB chromaticity of a Planck spectrum,
+// indexed by log10(T) in [3.0, 4.6] (1000 K .. ~40000 K, 32 entries).
+// Baked offline: Planck x CIE-1931 CMFs (Wyman-Sloan-Shirley fits) -> XYZ -> sRGB.
+// A Doppler/gravitationally shifted blackbody is exactly another blackbody at
+// T_obs = g * T_emit, so disk color = BB_LUT(g * T) is the physically correct
+// treatment (an RGB tint cannot move along the Planckian locus).
+constant float3 BB_LUT[32] = {
+    float3(4.28961f, 0.12308f, 0.00000f),  //    1000 K
+    float3(3.95561f, 0.22237f, 0.00000f),  //    1126 K
+    float3(3.61761f, 0.32284f, 0.00000f),  //    1268 K
+    float3(3.28964f, 0.42033f, 0.00000f),  //    1428 K
+    float3(2.98092f, 0.51210f, 0.00000f),  //    1609 K
+    float3(2.69679f, 0.59656f, 0.00000f),  //    1812 K
+    float3(2.43484f, 0.67163f, 0.02771f),  //    2040 K
+    float3(2.19622f, 0.73653f, 0.08751f),  //    2298 K
+    float3(1.98397f, 0.79219f, 0.16113f),  //    2588 K
+    float3(1.79676f, 0.83907f, 0.24797f),  //    2914 K
+    float3(1.63279f, 0.87784f, 0.34675f),  //    3282 K
+    float3(1.49008f, 0.90927f, 0.45562f),  //    3696 K
+    float3(1.36662f, 0.93420f, 0.57227f),  //    4163 K
+    float3(1.26041f, 0.95347f, 0.69411f),  //    4688 K
+    float3(1.16955f, 0.96793f, 0.81842f),  //    5279 K
+    float3(1.09224f, 0.97838f, 0.94254f),  //    5946 K
+    float3(1.02678f, 0.98558f, 1.06399f),  //    6696 K
+    float3(0.97158f, 0.99021f, 1.18065f),  //    7541 K
+    float3(0.92519f, 0.99288f, 1.29083f),  //    8492 K
+    float3(0.88628f, 0.99410f, 1.39333f),  //    9564 K
+    float3(0.85368f, 0.99429f, 1.48745f),  //   10771 K
+    float3(0.82635f, 0.99378f, 1.57291f),  //   12130 K
+    float3(0.80342f, 0.99284f, 1.64980f),  //   13661 K
+    float3(0.78415f, 0.99163f, 1.71846f),  //   15385 K
+    float3(0.76790f, 0.99031f, 1.77943f),  //   17326 K
+    float3(0.75417f, 0.98895f, 1.83332f),  //   19513 K
+    float3(0.74252f, 0.98762f, 1.88081f),  //   21975 K
+    float3(0.73261f, 0.98635f, 1.92256f),  //   24748 K
+    float3(0.72415f, 0.98517f, 1.95922f),  //   27872 K
+    float3(0.71690f, 0.98407f, 1.99138f),  //   31389 K
+    float3(0.71067f, 0.98308f, 2.01958f),  //   35350 K
+    float3(0.70530f, 0.98218f, 2.04432f),  //   39811 K
+};
+
+static inline float3 blackbody_color(float T) {
+    float u = (log10(max(T, 1.0f)) - 3.0f) / 1.6f * 31.0f;
+    u = clamp(u, 0.0f, 30.999f);
+    int   i = int(u);
+    float f = u - float(i);
+    return mix(BB_LUT[i], BB_LUT[i + 1], f);
 }
 
-// 3-octave variant for raytrace disk sampling (cheaper, visually close)
-static inline half fbm_half3(float3 p, float t) {
-    half v = 0.0h;
-    half a = 0.5h;
-    [[unroll]]
-    for (int i=0; i<3; i++) {
-        v += a * noise_half(p + t * 0.3f);
-        p = p * 2.02f + float3(10.0f);
-        a *= 0.5h;
-    }
-    return v;
+// Diverging blue-white-red colormap for the redshift lens, centered at t=0.5.
+static inline float3 diverging_map(float t) {
+    t = clamp(t, 0.0f, 1.0f);
+    float3 blue  = float3(0.13f, 0.30f, 0.89f);
+    float3 white = float3(0.95f, 0.95f, 0.95f);
+    float3 red   = float3(0.85f, 0.10f, 0.09f);
+    return (t < 0.5f) ? mix(red, white, t * 2.0f)
+                      : mix(white, blue, t * 2.0f - 1.0f);
 }
 
-// --- FLUID DYNAMICS ---
-
-kernel void simulate_disk_fluid(texture2d<float, access::sample> inTex [[texture(0)]],
-                                texture2d<float, access::write> outTex [[texture(1)]],
-                                constant SystemUniforms& sys [[buffer(0)]],
-                                uint2 pix [[thread_position_in_grid]]) {
-    uint w = outTex.get_width(); uint h = outTex.get_height();
-    if (pix.x >= w || pix.y >= h) return;
-
-    float2 uv = (float2(pix) + 0.5f) / float2(w, h);
-    float2 centered = uv - 0.5f;
-    float r = length(centered);
-    float phi = atan2(centered.y, centered.x);
-
-    float v_ang = 0.6f / max(0.01f, pow(r, 1.5f));
-    float delta_phi = v_ang * sys.dt_sim * 0.2f;
-    float2 prev_uv = float2(r * cos(phi - delta_phi), r * sin(phi - delta_phi)) + 0.5f;
-    
-    constexpr sampler s(filter::linear, address::clamp_to_edge);
-    float4 val = inTex.sample(s, prev_uv);
-    
-    float noise_val = (float)fbm_half(float3(uv * 15.0f, sys.time * 0.1f), sys.time * 0.05f);
-    if (r > 0.08f && r < 0.48f) {
-        val.x = mix(val.x, noise_val, 0.04f);
-        val.y = mix(val.y, (float)noise_half(float3(uv * 30.0f, -sys.time * 0.2f)), 0.02f);
-    } else {
-        val.xy *= 0.94f;
-    }
-    outTex.write(val, pix);
+// "Hot" colormap (black -> red -> orange -> white) for the EHT lens.
+static inline float3 hot_map(float t) {
+    t = clamp(t, 0.0f, 1.0f);
+    return float3(clamp(3.0f * t,        0.0f, 1.0f),
+                  clamp(3.0f * t - 1.0f, 0.0f, 1.0f),
+                  clamp(3.0f * t - 2.0f, 0.0f, 1.0f));
 }
 
-// --- RAYTRACING ---
+// --- BACKGROUND ---
 
 static inline half3 sampleBackground_half(float3 rd, float time, float scint, float nebula_int) {
+    // Default: dark, smooth sky. The procedural starfield is a moiré factory
+    // under single-sample raycasting through curved spacetime; the cinematic
+    // toggles bring it back, and temporal accumulation (jittered rays) tames it.
     float n1 = (float)noise_half(rd * 2.5f + time * 0.04f);
     float n2 = (float)noise_half(rd * 4.5f - time * 0.02f);
-    half3 nebula = mix(half3(0.002h, 0.005h, 0.015h), half3(0.02h, 0.01h, 0.04h), (half)n1 * 0.5h + 0.5h);
+    half3 nebula = mix(half3(0.001h, 0.002h, 0.006h),
+                      half3(0.012h, 0.006h, 0.024h),
+                      (half)n1 * 0.5h + 0.5h) * (half)nebula_int;
     nebula += half3(0.04h, 0.015h, 0.06h) * pow(max(0.0f, n2), 4.0f) * (half)nebula_int;
-    
-    float3 p = rd * 600.0f;
-    float3 id = floor(p);
-    float h = hash13(id);
+
     half3 col = nebula;
-    if (h > 0.9988f) {
-        float pulse = 1.0f + scint * 0.5f * sin(time * 4.0f + h * 100.0f);
-        col += half3(1.5h, 1.8h, 2.5h) * (half)(pulse * pow(hash13(id + 0.5f), 20.0f) * 15.0f);
+    if (scint > 0.0f) {
+        float3 p = rd * 600.0f;
+        float3 id = floor(p);
+        float h = hash13(id);
+        if (h > 0.99995f) {
+            float pulse = 1.0f + scint * 0.5f * sin(time * 4.0f + h * 100.0f);
+            col += half3(0.9h, 1.0h, 1.2h)
+                 * (half)(pulse * pow(hash13(id + 0.5f), 30.0f) * 4.0f);
+        }
     }
     return col;
 }
 
+// Lat-long checkerboard sky for the lensing-map lens: makes light deflection
+// legible with all astrophysics stripped out (DNGR Fig. 13 convention: distinct
+// quadrant tints + a marked antipode patch so multiple images are identifiable).
+static inline float3 checker_sky(float3 rd, float3 cam_fwd) {
+    float th = acos(clamp(rd.y, -1.0f, 1.0f));
+    float ph = atan2(rd.z, rd.x);
+    const float cell = 0.2617994f;             // 15 degrees
+    float parity = fmod(floor(th / cell) + floor((ph + 3.14159265f) / cell), 2.0f);
+    float3 base = (parity < 0.5f) ? float3(0.05f, 0.06f, 0.09f) : float3(0.55f, 0.58f, 0.65f);
+    // Quadrant tint: hemisphere (up/down) x (front/back relative to phi=0).
+    float3 tint = float3(1.0f);
+    if (rd.y >  0.0f && cos(ph) >  0.0f) tint = float3(1.0f, 0.75f, 0.75f);
+    if (rd.y >  0.0f && cos(ph) <= 0.0f) tint = float3(0.75f, 1.0f, 0.75f);
+    if (rd.y <= 0.0f && cos(ph) >  0.0f) tint = float3(0.75f, 0.80f, 1.0f);
+    if (rd.y <= 0.0f && cos(ph) <= 0.0f) tint = float3(1.0f, 1.0f, 0.72f);
+    float3 col = base * tint;
+    // Antipode patch (directly behind the camera): every appearance of this red
+    // spot in the image is one more image order of the same sky point.
+    if (dot(rd, -cam_fwd) > 0.9986f) col = float3(0.9f, 0.08f, 0.08f);
+    return col;
+}
+
 // =====================================================================
-// EXACT KERR-NEWMAN GEODESIC INTEGRATOR
-//   Boyer-Lindquist coordinates with Carter's separation constant.
-//   Reference: Carter, Phys. Rev. 174, 1559 (1968); Cunningham & Bardeen,
-//   ApJ 183, 237 (1973). Same formulation used by ipole, GYOTO, RAPTOR.
+// EXACT KERR-NEWMAN NULL GEODESICS — super-Hamiltonian first-order form.
+//
+//   Boyer-Lindquist coordinates, Carter-separated potentials, but the
+//   integrator evolves the MOMENTA (p_r, p_theta) with Hamilton's
+//   equations instead of the +/-sqrt(R), +/-sqrt(Theta) root-tracking
+//   form. The root form freezes at turning points (sqrt(max(R,0)) has
+//   zero derivative in the forbidden region); the Hamiltonian form
+//   passes through them smoothly — the same reason DNGR (James et al.
+//   2015, CQG 32 065001, Eq. A.15) chose it.
 //
 // Conventions (matching the host's slider semantics):
-//   sys.spin    = a/M ∈ [-1, 1]   (dimensionless Kerr spin)
-//   sys.charge  = Q/M ∈ [0, 1]    (dimensionless charge)
-//   r, λ        in rs = 2M units
-//   M = 1/2 in these units, so 2Mr → r and Δ = r² − r + a² + Q²
-//   "a" inside the metric below is the dimensional spin in rs units = (a/M)/2.
+//   sys.spin    = a/M in [-1, 1]   (dimensionless Kerr spin)
+//   sys.charge  = Q/M in [0, 1]    (dimensionless charge)
+//   r, lambda   in rs = 2M units, so M = 1/2 and
+//   Delta = r^2 - r + a^2 + Q^2,   "a" below = (a/M)/2,  Q = (Q/M)/2.
 //
-// Null-geodesic conserved quantities:
-//   E   = −p_t = 1                (affine normalization)
-//   L_z =  p_φ                    (axial symmetry)
-//   Q_C = p_θ² + cos²θ (L_z²/sin²θ − a²)   (Carter, μ = 0)
+// Null-geodesic conserved quantities (E = -p_t = 1 by affine choice):
+//   L  = p_phi
+//   QC = p_theta^2 + cos^2(th) (L^2/sin^2(th) - a^2)      (Carter, mu = 0)
 //
-// Hamilton's equations reduce, via Carter's separation, to:
-//   Σ (dr/dλ)  = ±√R(r)
-//   Σ (dθ/dλ) = ±√Θ(θ)
-//   Σ (dφ/dλ) = (a P − a² L_z + L_z Δ/sin²θ) / Δ
-// with R(r) = P² − Δ[(L_z − a)² + Q_C],  Θ(θ) = Q_C + a²cos²θ − L_z²cot²θ,
-//      P = r² + a² − a L_z,  Σ = r² + a²cos²θ,  Δ = r² − r + a² + Q_ch².
-//
-// We track the radial and polar momentum signs (s_r, s_θ) and flip them
-// when R or Θ crosses zero (turning points).
+// On-shell (H = 0) Hamilton equations:
+//   dr/dl      = Delta p_r / Sigma
+//   dth/dl     = p_theta / Sigma
+//   dphi/dl    = [a (r - Q^2) - a^2 L] / (Delta Sigma) + L / (Sigma sin^2 th)
+//   dp_r/dl    = [ d/dr (R/Delta) - Delta' p_r^2 ] / (2 Sigma)
+//   dp_th/dl   = [ -2 a^2 sin th cos th + 2 L^2 cos th / sin^3 th ] / (2 Sigma)
+// with R(r) = P^2 - Delta [(L-a)^2 + QC],  P = r^2 + a^2 - a L,
+//      Sigma = r^2 + a^2 cos^2 th,  Delta' = 2r - 1.
+// The null condition Delta p_r^2 + p_th^2 = R/Delta + Theta(th) is enforced
+// by the initial conditions and preserved to integrator accuracy.
 // =====================================================================
 
 struct KerrConst {
-    float a;        // real spin in rs units (= sys.spin / 2)
+    float a;        // spin in rs units (= sys.spin / 2), signed
     float a2;
-    float Q_ch_sq;  // real charge² in rs units (= (sys.charge / 2)²)
-    float L;        // L_z, conserved
-    float QC;       // Carter constant, conserved
+    float Q2;       // charge^2 in rs units (= (sys.charge / 2)^2)
+    float E;        // conserved energy of the traced ray: -1 (past-directed).
+                    // The pixel's light ARRIVES at the camera; its backward
+                    // extension is the past-directed continuation of the
+                    // arriving momentum. Tracing a future-directed E=+1 ray
+                    // along the view direction instead integrates the TIME-
+                    // REVERSED photon — harmless in Schwarzschild (t -> -t is
+                    // an isometry) but mirrored in Kerr, which pairs the
+                    // shadow's flattened side with the WRONG Doppler side.
+    float L;        // traced ray's conserved L_z (for E = -1)
+    float QC;       // Carter constant
+    float L_arr;    // the photon's impact ratio xi = L/E = -L: used by the
+                    // emitter g-factor g = 1/(U^t (1 - Omega xi)).
 };
 
 static inline float kerr_Sigma(float r, float cos_th, float a2) {
     return r * r + a2 * cos_th * cos_th;
 }
 
-static inline float kerr_Delta(float r, float a2, float Q_ch_sq) {
-    return r * r - r + a2 + Q_ch_sq;
+static inline float kerr_Delta(float r, float a2, float Q2) {
+    return r * r - r + a2 + Q2;
 }
 
-// Radial potential R(r) for E = 1.
 static inline float kerr_R(float r, KerrConst k) {
-    float P = r * r + k.a2 - k.a * k.L;
-    float B = (k.L - k.a) * (k.L - k.a) + k.QC;
-    float Delta = kerr_Delta(r, k.a2, k.Q_ch_sq);
-    return P * P - Delta * B;
+    float P = k.E * (r * r + k.a2) - k.a * k.L;
+    float B = (k.L - k.a * k.E) * (k.L - k.a * k.E) + k.QC;
+    return P * P - kerr_Delta(r, k.a2, k.Q2) * B;
 }
 
-// Polar potential Θ(θ) for E = 1.
 static inline float kerr_Theta(float cos_th, float sin_th, KerrConst k) {
-    float s2 = sin_th * sin_th;
-    if (s2 < 1e-9f) s2 = 1e-9f;     // dodge polar coord singularity
+    float s2 = max(sin_th * sin_th, 1e-4f);
     return k.QC + k.a2 * cos_th * cos_th - k.L * k.L * cos_th * cos_th / s2;
 }
 
-// dφ/dλ from the Carter form (E = 1).
-//   Σ dφ/dλ = a (r − Q_ch²)/Δ − a²L/Δ + L/sin²θ
-static inline float kerr_dphi(float r, float sin_th, KerrConst k) {
-    float Delta = kerr_Delta(r, k.a2, k.Q_ch_sq);
-    float s2 = sin_th * sin_th;
-    if (s2 < 1e-9f) s2 = 1e-9f;
-    return (k.a * (r - k.Q_ch_sq) - k.a2 * k.L) / Delta + k.L / s2;
+// Geodesic state and its lambda-derivative.
+struct GeoState { float r, th, ph, pr, pth; };
+
+static inline GeoState kerr_rhs(GeoState s, KerrConst k) {
+    float c = cos(s.th);
+    float sn = sin(s.th);
+    float sn_g   = (sn >= 0.0f) ? max(sn, 1e-4f) : min(sn, -1e-4f);  // pole guard
+    float s2     = sn_g * sn_g;
+    float Sigma  = kerr_Sigma(s.r, c, k.a2);
+    float Delta  = kerr_Delta(s.r, k.a2, k.Q2);
+    float Dp     = 2.0f * s.r - 1.0f;                                 // Delta'
+    float P      = k.E * (s.r * s.r + k.a2) - k.a * k.L;
+    float B      = (k.L - k.a * k.E) * (k.L - k.a * k.E) + k.QC;
+    float R      = P * P - Delta * B;
+    float Rp     = 4.0f * s.r * P * k.E - Dp * B;                     // R'
+    float D2     = Delta * Delta;
+    float RoDp   = (Rp * Delta - R * Dp) / max(D2, 1e-12f);           // (R/Delta)'
+
+    GeoState d;
+    float inv_Sigma = 1.0f / Sigma;
+    d.r   = Delta * s.pr * inv_Sigma;
+    d.th  = s.pth * inv_Sigma;
+    d.ph  = ((k.a * (k.E * (s.r - k.Q2)) - k.a2 * k.L) / max(Delta, 1e-9f) + k.L / s2) * inv_Sigma;
+    d.pr  = (RoDp - Dp * s.pr * s.pr) * 0.5f * inv_Sigma;
+    d.pth = (-2.0f * k.a2 * sn * c + 2.0f * k.L * k.L * c / (s2 * sn_g)) * 0.5f * inv_Sigma;
+    return d;
 }
 
-// One RK4 step of the (r, θ, φ) state. The sign trackers s_r, s_θ are
-// pre-multiplied into √R / √Θ; turning-point detection runs in the caller.
-static inline void kerr_rk4(thread float& r, thread float& th, thread float& ph,
-                            float s_r, float s_th, float dlambda, KerrConst k)
-{
-    // Each k_i evaluates (dr, dθ, dφ)/dλ at an intermediate state.
-    auto rhs = [&](float r_, float th_) {
-        float c = cos(th_);
-        float s = sin(th_);
-        float Sigma = kerr_Sigma(r_, c, k.a2);
-        float R = kerr_R(r_, k);
-        float Th = kerr_Theta(c, s, k);
-        float dr = s_r  * sqrt(max(R, 0.0f)) / Sigma;
-        float dt = s_th * sqrt(max(Th, 0.0f)) / Sigma;
-        float dp = kerr_dphi(r_, s, k) / Sigma;
-        return float3(dr, dt, dp);
-    };
-
-    float3 k1 = rhs(r, th);
-    float3 k2 = rhs(r + 0.5f * dlambda * k1.x, th + 0.5f * dlambda * k1.y);
-    float3 k3 = rhs(r + 0.5f * dlambda * k2.x, th + 0.5f * dlambda * k2.y);
-    float3 k4 = rhs(r + dlambda * k3.x,         th + dlambda * k3.y);
-
-    r  += dlambda * (k1.x + 2.0f * k2.x + 2.0f * k3.x + k4.x) / 6.0f;
-    th += dlambda * (k1.y + 2.0f * k2.y + 2.0f * k3.y + k4.y) / 6.0f;
-    ph += dlambda * (k1.z + 2.0f * k2.z + 2.0f * k3.z + k4.z) / 6.0f;
+static inline GeoState geo_add(GeoState s, GeoState d, float h) {
+    GeoState o;
+    o.r = s.r + h * d.r;  o.th = s.th + h * d.th;  o.ph = s.ph + h * d.ph;
+    o.pr = s.pr + h * d.pr;  o.pth = s.pth + h * d.pth;
+    return o;
 }
 
-// Convert BL (r, θ, φ) to BH-local Cartesian (rs units), with y as the spin
-// axis. Uses the spherical approximation; the spheroidal correction is
-// O(a²/r²) and irrelevant for star-intersection bounding-sphere tests.
+// One RK4 step. No sign tracking: p_r, p_theta cross zero smoothly.
+static inline GeoState kerr_rk4(GeoState s, float h, KerrConst k) {
+    GeoState k1 = kerr_rhs(s, k);
+    GeoState k2 = kerr_rhs(geo_add(s, k1, 0.5f * h), k);
+    GeoState k3 = kerr_rhs(geo_add(s, k2, 0.5f * h), k);
+    GeoState k4 = kerr_rhs(geo_add(s, k3, h), k);
+    GeoState o;
+    o.r   = s.r   + h * (k1.r   + 2.0f * (k2.r   + k3.r)   + k4.r)   / 6.0f;
+    o.th  = s.th  + h * (k1.th  + 2.0f * (k2.th  + k3.th)  + k4.th)  / 6.0f;
+    o.ph  = s.ph  + h * (k1.ph  + 2.0f * (k2.ph  + k3.ph)  + k4.ph)  / 6.0f;
+    o.pr  = s.pr  + h * (k1.pr  + 2.0f * (k2.pr  + k3.pr)  + k4.pr)  / 6.0f;
+    o.pth = s.pth + h * (k1.pth + 2.0f * (k2.pth + k3.pth) + k4.pth) / 6.0f;
+    return o;
+}
+
+// BL (r, th, ph) -> BH-local Cartesian (rs units), y = spin axis.
 static inline float3 bl_to_cart(float r, float sin_th, float cos_th, float sin_ph, float cos_ph) {
     return float3(r * sin_th * cos_ph, r * cos_th, r * sin_th * sin_ph);
 }
 
-// Local spherical basis at (r, θ, φ) expressed in Cartesian (rs units).
+// Local spherical basis at (r, th, ph) in Cartesian (rs units).
 static inline void bl_basis(float sin_th, float cos_th, float sin_ph, float cos_ph,
                             thread float3& r_hat, thread float3& th_hat, thread float3& ph_hat) {
     r_hat  = float3(sin_th * cos_ph,  cos_th,           sin_th * sin_ph);
@@ -215,8 +278,75 @@ static inline void bl_basis(float sin_th, float cos_th, float sin_ph, float cos_
     ph_hat = float3(-sin_ph,           0.0f,            cos_ph);
 }
 
+// =====================================================================
+// Optically-thick Novikov-Thorne surface emission with the physical
+// temperature-shift color pipeline:
+//
+//   F(r)  ∝ (r_in/r)^3 (1 − sqrt(r_in/r))     (Page-Thorne flux; zero-torque
+//                                              BC: F = 0 at r_in, peak at
+//                                              r = (49/36) r_in)
+//   T(r)  = T_peak · Fn(r)^{1/4}               (Fn = F normalized to peak 1)
+//   g     = 1 / [U^t (1 − Ω L_arr)]            (covariant redshift+Doppler,
+//                                              KN metric, ARRIVING photon L)
+//   T_obs = g · T                              (shifted blackbody is a
+//                                              blackbody at gT)
+//   I_obs = Fn · g^4 (capped)                  (bolometric Liouville)
+//
+// The Kerr-Newman circular-orbit frequency (rs units, M = 1/2):
+//   Ω = sqrt(M r − Q^2) / (r^2 + a sqrt(M r − Q^2)),  signed a: for
+//   spin < 0 the flow (always +phi) is retrograde relative to the hole
+//   and the host supplies the RETROGRADE ISCO as r_in.
+// =====================================================================
+static float3 disk_surface_emission(
+    float rh,
+    KerrConst kerr,
+    constant SystemUniforms& sys,
+    float r_in,
+    float r_out,
+    thread float& g_out)
+{
+    float r_ratio = r_in / rh;
+    float flux    = r_ratio * r_ratio * r_ratio * max(1.0f - sqrt(r_ratio), 0.0f);
+    // Normalize: peak of x^3(1-sqrt(x)) over x = r_in/r is at x = 36/49.
+    const float x_pk = 36.0f / 49.0f;
+    const float f_pk = x_pk * x_pk * x_pk * (1.0f /* - sqrt(36/49) = 1/7 */) / 7.0f;
+    float Fn = flux / f_pk;
+
+    float outer_fade = 1.0f - smoothstep(r_out * 0.7f, r_out, rh);
+
+    // Kerr-Newman equatorial metric + circular-orbit frequency (charge-aware).
+    float m_kn   = (rh - kerr.Q2) / (rh * rh);        // (2Mr - Q^2)/r^2 in rs units
+    float gtt_eq   = -(1.0f - m_kn);
+    float gtphi_eq = -kerr.a * m_kn;
+    float gphph_eq =  rh * rh + kerr.a2 + kerr.a2 * m_kn;
+    float s_kn     = sqrt(max(0.5f * rh - kerr.Q2, 0.0f));
+    float Omega    = s_kn / (rh * rh + kerr.a * s_kn);
+
+    float U_denom  = -gtt_eq - 2.0f * gtphi_eq * Omega - gphph_eq * Omega * Omega;
+    if (U_denom <= 1e-6f) { g_out = 1.0f; return float3(0.0f); }  // spacelike orbit: no emitter
+    float Ut       = rsqrt(U_denom);
+    float g        = 1.0f / max(Ut * (1.0f - Omega * kerr.L_arr), 1e-3f);
+    g_out = g;
+
+    float T_emit = sys.disk_temp * pow(max(Fn, 1e-6f), 0.25f);
+    float T_obs  = T_emit;
+    float boost  = 1.0f;
+    if (sys.beaming_mode == BEAM_FULL) {
+        T_obs = g * T_emit;
+        boost = min(g * g * g * g, 15.0f);   // BPT g^4 cap: keeps the approaching
+                                             // inner limb inside tonemap range
+    } else if (sys.beaming_mode == BEAM_NO_BOOST) {
+        T_obs = g * T_emit;
+    }
+
+    float3 chroma = blackbody_color(T_obs);
+    // The 18.0 multiplier is the only artistic knob: calibrated so the disk
+    // reads mid-gray after auto-exposure on the default scene. Shape and
+    // ratios come from the Page-Thorne + Liouville physics above.
+    return chroma * Fn * boost * outer_fade * sys.disk_density * 18.0f;
+}
+
 kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
-                     texture2d<float, access::sample> fluidTex [[texture(1)]],
                      constant CameraData& cam [[buffer(0)]],
                      const device SimObject* objs [[buffer(1)]],
                      constant ObjectsUniform& u_obj [[buffer(2)]],
@@ -224,9 +354,13 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
                      uint2 pix [[thread_position_in_grid]]) {
     uint w = out.get_width(); uint h = out.get_height();
     if (pix.x >= w || pix.y >= h) return;
-    
-    float ur = (2.0f * (float(pix.x) + 0.5f) / float(w) - 1.0f) * cam.aspect * cam.tanHalfFov;
-    float vr = (1.0f - 2.0f * (float(pix.y) + 0.5f) / float(h)) * cam.tanHalfFov;
+
+    // Subpixel jitter (Halton, from the host): with temporal accumulation this
+    // converges to supersampled ground truth on a static camera.
+    float px = float(pix.x) + 0.5f + sys.jitter_x;
+    float py = float(pix.y) + 0.5f + sys.jitter_y;
+    float ur = (2.0f * px / float(w) - 1.0f) * cam.aspect * cam.tanHalfFov;
+    float vr = (1.0f - 2.0f * py / float(h)) * cam.tanHalfFov;
     float3 rd = normalize(ur * cam.camRight.xyz + vr * cam.camUp.xyz + cam.camForward.xyz);
     float3 ro = cam.camPos.xyz;
 
@@ -234,27 +368,19 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
     const device SimObject* bh = &objs[u_obj.bh_index];
     float rs = bh->posRadius.w;
     float3 bhPos = bh->posRadius.xyz;
-
-    // Camera position relative to BH, in rs units, in BH-local Cartesian.
     float3 ro_bh = (ro - bhPos) / rs;
 
-    // ----- Kerr-Newman parameters in rs units (M = 1/2). -----
-    // Slider sys.spin is dimensionless a/M; the dimensional spin in rs units
-    // is half that. Same for charge.
     KerrConst kerr;
-    kerr.a       = 0.5f * sys.spin;
-    kerr.a2      = kerr.a * kerr.a;
-    float Q_ch   = 0.5f * sys.charge;
-    kerr.Q_ch_sq = Q_ch * Q_ch;
-    // L and QC are filled in below from the camera ray.
+    kerr.a  = 0.5f * sys.spin;
+    kerr.a2 = kerr.a * kerr.a;
+    float Q_ch = 0.5f * sys.charge;
+    kerr.Q2 = Q_ch * Q_ch;
 
     float r_horizon = sys.r_horizon;
-    float r_isco    = sys.r_isco;
-    const float r_in   = max(r_isco, r_horizon * 1.2f);
-    const float r_out  = 22.0f;
-    const float disk_h = sys.disk_height;     // half-thickness in rs (Cartesian y)
+    const float r_in  = max(sys.r_isco, r_horizon * 1.2f);
+    const float r_out = sys.disk_r_out;
 
-    // ----- Convert camera Cartesian → Boyer-Lindquist coordinates. -----
+    // ----- Camera Cartesian -> Boyer-Lindquist. -----
     float r_obs       = length(ro_bh);
     float cos_th_obs  = clamp(ro_bh.y / r_obs, -1.0f, 1.0f);
     float sin_th_obs  = sqrt(max(1.0f - cos_th_obs * cos_th_obs, 1e-9f));
@@ -262,293 +388,333 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
     float sin_ph_obs  = sin(phi_obs);
     float cos_ph_obs  = cos(phi_obs);
 
-    // Local spherical basis at the observer (Cartesian world).
     float3 r_hat, th_hat, ph_hat;
     bl_basis(sin_th_obs, cos_th_obs, sin_ph_obs, cos_ph_obs, r_hat, th_hat, ph_hat);
-
-    // Decompose the pixel ray direction into the observer's local frame.
     float n_r  = dot(rd, r_hat);
     float n_th = dot(rd, th_hat);
     float n_ph = dot(rd, ph_hat);
 
-    // ----- Static-observer tetrad initial conditions. -----
-    // For an observer at rest in BL coords (outside any ergosphere), the
-    // photon's covariant momenta are p_i = √g_ii · n_i / √(−g_tt) per axis,
-    // with E ≡ −p_t = 1 set by affine choice. We ignore the g_tφ tetrad
-    // correction; at r_obs ~ 20 rs it contributes < 1.5% to L_z.
+    // ----- ZAMO tetrad initial conditions (Kerr-Newman: 2Mr -> r - Q^2). -----
+    //   alpha^2 = -g_tt + g_tphi^2 / g_phph      (lapse)
+    //   omega_z = -g_tphi / g_phph               (frame-drag rate)
+    // With affine parameter chosen so E = 1:
+    //   L    =  sqrt(g_phph) n_phi / (alpha + omega_z sqrt(g_phph) n_phi)
+    //   p_r  =  sqrt(g_rr)   n_r   / (same denominator)
+    //   p_th =  sqrt(g_thth) n_th  / (same denominator)
     float Sigma_obs = kerr_Sigma(r_obs, cos_th_obs, kerr.a2);
-    float Delta_obs = kerr_Delta(r_obs, kerr.a2, kerr.Q_ch_sq);
-    float gtt_neg   = 1.0f - r_obs / Sigma_obs;             // = -g_tt (positive outside ergosphere)
+    float Delta_obs = kerr_Delta(r_obs, kerr.a2, kerr.Q2);
+    float s2_obs    = sin_th_obs * sin_th_obs;
+    float m_kn      = r_obs - kerr.Q2;               // 2Mr - Q^2 in rs units
+    float gtt_neg   = 1.0f - m_kn / Sigma_obs;
+    float gtphi     = -kerr.a * m_kn * s2_obs / Sigma_obs;
     float grr       = Sigma_obs / max(Delta_obs, 1e-9f);
     float gthth     = Sigma_obs;
-    // g_φφ = ((r²+a²) Σ + a² r sin²θ) sin²θ / Σ   [in rs units, 2M = 1]
-    float gphph_over_s2 = ((r_obs * r_obs + kerr.a2) * Sigma_obs
-                          + kerr.a2 * r_obs * sin_th_obs * sin_th_obs) / Sigma_obs;
-    float gphph     = gphph_over_s2 * sin_th_obs * sin_th_obs;
+    float gphph     = ((r_obs * r_obs + kerr.a2) * Sigma_obs
+                       + kerr.a2 * m_kn * s2_obs) * s2_obs / Sigma_obs;
 
-    float omega_obs = rsqrt(max(gtt_neg, 1e-9f));            // = 1/√(-g_tt)
-    float p_r_init  = sqrt(grr)   * omega_obs * n_r;
-    float p_th_init = sqrt(gthth) * omega_obs * n_th;
-    kerr.L          = sqrt(max(gphph, 0.0f)) * omega_obs * n_ph;
+    float gphph_safe = max(gphph, 1e-9f);
+    float omega_z    = -gtphi / gphph_safe;
+    float alpha      = sqrt(max(gtt_neg + gtphi * gtphi / gphph_safe, 1e-9f));
+    float sqrt_gphph = sqrt(max(gphph, 0.0f));
 
-    // Carter constant from p_θ. For E = 1:
-    //   p_θ² = Q_C + cos²θ (a² − L²/sin²θ)   →   Q_C = p_θ² − cos²θ(a² − L²/sin²θ)
+    // Past-directed backward ray: the arriving photon's momentum, continued
+    // into the past, normalized so E = -p_t = -1. In the ZAMO frame this
+    // gives the (alpha - omega_z ...) denominator — the future-directed
+    // (alpha + ...) normalization would trace the time-reversed photon and
+    // mirror every frame-dragging asymmetry.
+    float E_setup     = alpha - omega_z * sqrt_gphph * n_ph;
+    float E_setup_inv = 1.0f / max(E_setup, 1e-6f);
+    kerr.E      = -1.0f;
+    kerr.L      = sqrt_gphph  * n_ph * E_setup_inv;
+    float p_r0  = sqrt(grr)   * n_r  * E_setup_inv;
+    float p_th0 = sqrt(gthth) * n_th * E_setup_inv;
+    // The photon's impact ratio xi = L/E = -L drives the emitter g-factor.
+    kerr.L_arr = -kerr.L;
+
     {
         float c2 = cos_th_obs * cos_th_obs;
-        float s2 = sin_th_obs * sin_th_obs;
-        kerr.QC = p_th_init * p_th_init - c2 * (kerr.a2 - kerr.L * kerr.L / max(s2, 1e-9f));
+        kerr.QC = p_th0 * p_th0 + c2 * (kerr.L * kerr.L / max(s2_obs, 1e-9f) - kerr.a2);
     }
 
-    // ----- Integrator state (BL coordinates + sign trackers). -----
-    float r        = r_obs;
-    float th       = acos(cos_th_obs);
-    float ph       = phi_obs;
-    float s_r      = (p_r_init  < 0.0f) ? -1.0f : 1.0f;
-    float s_th     = (p_th_init < 0.0f) ? -1.0f : 1.0f;
-    float prev_R   = kerr_R(r, kerr);
-    float prev_Th  = kerr_Theta(cos_th_obs, sin_th_obs, kerr);
+    GeoState s;
+    s.r = r_obs; s.th = acos(cos_th_obs); s.ph = phi_obs;
+    s.pr = p_r0; s.pth = p_th0;
+
     float prev_cos = cos_th_obs;
-    int   disk_crossings = 0;
-    float init_abs_n_th  = abs(n_th);
+    float prev_r   = r_obs;
+    float prev_ph  = phi_obs;
+    // Polar-cap phi bypass: inside th < CAP of the axis, dphi/dlambda is
+    // numerically meaningless (BL coordinate singularity, clamped 1/sin^2
+    // integrand). Freeze phi at cap entry and apply the exact through-the-pole
+    // jump of pi on exit — exact in spherical symmetry, O(a * CAP) for Kerr.
+    const float POLE_CAP = 0.01f;
+    bool  in_pole_cap = false;
+    float ph_cap_entry = 0.0f;
+    int   crossings = 0;         // equatorial crossings BEFORE the accepted hit
+    int   hit_order = -1;        // image order n of the accepted disk hit
+    float hit_g     = 1.0f;      // g-factor at the accepted disk hit
+    int   fate      = 0;         // 0 = budget exhausted, 1 = captured, 2 = escaped,
+                                 // 3 = disk hit, 4 = absorbed in foreground media
+
+    const float r_esc = max(500.0f, r_obs * 1.05f);
 
     float3 col_accum = float3(0.0f);
     float  trans     = 1.0f;
 
-    // ----- Geodesic integration loop. -----
     for (int i = 0; i < 1200; i++) {
-        // Horizon: terminate slightly above r_+ to avoid Δ → 0 singularity.
-        if (r < r_horizon * 1.01f) { trans = 0.0f; col_accum = float3(0.0f); break; }
-        if (r > 500.0f) break;
+        // Capture: trans = 0 keeps the background out (the escape block is
+        // gated on fate), but emission already accumulated BETWEEN the camera
+        // and the horizon (jets, glow) is real foreground light and is kept —
+        // zeroing it would notch the jet where it crosses the shadow.
+        if (s.r < r_horizon * 1.02f) { fate = 1; trans = 0.0f; break; }
+        if (s.r > r_esc)             { fate = 2; break; }
+        if (s.r > 30.0f && s.pr > 0.0f) { fate = 2; break; }
 
-        // Outward early-out: ray escaping past all disk/object influence.
-        float dr_sign = s_r * sqrt(max(prev_R, 0.0f));
-        if (r > 30.0f && dr_sign > 0.0f) break;
+        // ----- Adaptive affine step (RAPTOR-style inverse-sum controller). -----
+        // Step shrinks where any coordinate moves fast (photon-shell whirls,
+        // near-horizon approach) and grows to ~0.05 r in the far field.
+        GeoState d = kerr_rhs(s, kerr);
+        // Pole treatment (RAPTOR-style): the polar-rate term scales inversely
+        // with the distance to the nearest pole, so steps shrink through the
+        // coordinate singularity and the fast phi/p_theta swing is resolved;
+        // the dphi term is weighted by sin(theta) since coordinate phi-motion
+        // at the axis is degenerate and must not starve the step size.
+        float sin_th_rate = sqrt(max(1.0f - prev_cos * prev_cos, 0.0f));
+        float pole_dist = max(min(s.th, 3.14159265f - s.th), 1e-3f);
+        // The p_theta term resolves the STIFF polar turning point: |dtheta|
+        // vanishes exactly at the turn while the L^2/sin^3(theta) wall kicks
+        // p_theta impulsively — without this term the controller steps through
+        // the impulse and the theta-phase (hence every later equatorial
+        // crossing radius) is corrupted for near-axis rays.
+        float rate = fabs(d.r) / max(s.r, 0.5f) + fabs(d.th) / min(pole_dist, 1.0f)
+                   + fabs(d.pth) / (fabs(s.pth) + 1.0f)
+                   + fabs(d.ph) * sin_th_rate + 1e-9f;
+        float dlam = 0.05f / rate;
+        dlam = min(dlam, 0.35f * max(s.r - r_horizon, 1e-3f) / max(fabs(d.r), 1e-6f));
+        dlam = max(dlam, 1e-4f);
 
-        // Affine-parameter step. The natural length scale is the local r;
-        // tighten near the disk slab for accurate emission accumulation.
-        float dlam = max(r * 0.06f, 0.001f);
-        float y_cart = r * prev_cos;
-        if (abs(y_cart) < 3.0f * disk_h && r < r_out * 1.2f) {
-            // Near-disk: cap step. abs(p_θ)/Σ controls how fast we cross the
-            // slab in θ; |dy/dλ| ≈ |Σ dθ/dλ| / r ≈ |√Θ|/r approximately.
-            float cross_speed = min(abs(s_th * sqrt(max(prev_Th, 0.0f))) / max(r, 1e-3f) * 10.0f, 1.0f);
-            float dlam_cap    = mix(0.4f, 0.06f, cross_speed);
-            dlam              = min(dlam, dlam_cap);
+        s = kerr_rk4(s, dlam, kerr);
+
+        // Axis reflection: a ray that runs through the pole continues on the
+        // other side (the BL chart's double cover; the phi jump is handled by
+        // the polar-cap bypass below).
+        if (s.th < 0.0f)             { s.th = -s.th;             s.pth = -s.pth; }
+        else if (s.th > 3.14159265f) { s.th = 6.2831853f - s.th; s.pth = -s.pth; }
+
+        bool in_cap_now = (s.th < POLE_CAP) || (s.th > 3.14159265f - POLE_CAP);
+        if (in_cap_now && !in_pole_cap) { in_pole_cap = true; ph_cap_entry = prev_ph; }
+        else if (!in_cap_now && in_pole_cap) {
+            in_pole_cap = false;
+            s.ph = ph_cap_entry + 3.14159265f;
         }
+        if (in_pole_cap) s.ph = ph_cap_entry;
 
-        // RK4 step on (r, θ, φ).
-        kerr_rk4(r, th, ph, s_r, s_th, dlam, kerr);
+        float cos_th = cos(s.th);
 
-        // Sign updates at turning points: detect by R(r) or Θ(θ) crossing zero.
-        float cos_th = cos(th);
-        float sin_th = sqrt(max(1.0f - cos_th * cos_th, 1e-9f));
-        float Rn  = kerr_R(r, kerr);
-        float Thn = kerr_Theta(cos_th, sin_th, kerr);
-        if (Rn  < 0.0f && prev_R  > 0.0f) s_r  = -s_r;
-        if (Thn < 0.0f && prev_Th > 0.0f) s_th = -s_th;
-        prev_R  = Rn;
-        prev_Th = Thn;
-
-        // Photon-ring detection: equatorial-plane crossings = sign flips of cos θ.
-        if (prev_cos * cos_th < 0.0f) disk_crossings++;
-        prev_cos = cos_th;
-
-        // ----- Background star-sphere intersection (Cartesian, BH-local). -----
-        // Only consult when at least one lane is close enough for any star.
-        if (simd_any(r < 150.0f)) {
-            float sin_ph = sin(ph);
-            float cos_ph = cos(ph);
-            float3 pos_cart = bl_to_cart(r, sin_th, cos_th, sin_ph, cos_ph);
-            float3 p_world  = pos_cart * rs + bhPos;
-            for (int j = 0; j < u_obj.count; j++) {
-                if (j == u_obj.bh_index) continue;
-                float3 delta = p_world - objs[j].posRadius.xyz;
-                if (dot(delta, delta) < objs[j].posRadius.w * objs[j].posRadius.w) {
-                    col_accum += trans * objs[j].color.xyz * 25.0f;
-                    trans = 0.0f; break;
-                }
-            }
-        }
-        if (trans <= 0.0f) break;
-
-        // ----- Equatorial accretion-disk emission. -----
-        // The "disk slab" is |y_cart| < disk_h with rh = √(x² + z²) ∈ (r_in, r_out).
-        // In BL with y as spin axis, y_cart = r cos θ and rh = r sin θ.
-        float y_disk = r * cos_th;
-        if (abs(y_disk) < disk_h) {
-            float rh = r * sin_th;
-            if (rh > r_in && rh < r_out) {
-                float sin_ph = sin(ph);
-                float cos_ph = cos(ph);
-                float3 pos_cart = bl_to_cart(r, sin_th, cos_th, sin_ph, cos_ph);
-
-                float2 fluid_uv = float2(pos_cart.x, pos_cart.z) / 50.0f + 0.5f;
-                constexpr sampler s(filter::linear);
-                float2 f_val = fluidTex.sample(s, fluid_uv).xy;
-                float noise_val = (float)fbm_half3(float3(rh * 1.8f, ph * 5.0f, sys.time * 0.1f), sys.time * 0.02f);
-                noise_val = mix(noise_val, f_val.x, 0.6f + 0.4f * f_val.y);
-
-                float y_frac = 1.0f - abs(y_disk) / disk_h;
-
-                // Novikov-Thorne disk: Page-Thorne emissivity & temperature profile.
-                float r_ratio    = r_in / rh;
-                float emission   = r_ratio * r_ratio * r_ratio;
-                float inner_edge = smoothstep(0.0f, 0.15f, (rh - r_in) / max(r_in, 0.01f));
-                float outer_fade = 1.0f - smoothstep(0.7f, 1.0f, rh / r_out);
-                float density    = inner_edge * outer_fade * emission * (y_frac * y_frac * y_frac)
-                                 * (0.15f + 0.85f * noise_val) * sys.disk_density;
-
-                float T_base     = pow(r_ratio, 0.75f);
-                float T_boundary = pow(max(1.0f - sqrt(r_ratio), 0.001f), 0.25f);
-                float T_norm     = T_base * T_boundary;
-                half t = half(clamp(T_norm, 0.0f, 1.0f));
-                half3 dCol = mix(half3(0.12h, 0.01h, 0.0h),
-                                 half3(1.0h,  0.4h,  0.06h),
-                                 smoothstep(half(0.0h), half(0.3h), t));
-                dCol = mix(dCol, half3(1.0h, 0.75h, 0.3h),
-                           smoothstep(half(0.3h), half(0.6h), t));
-                dCol = mix(dCol, half3(1.0h, 0.95h, 0.85h),
-                           smoothstep(half(0.6h), half(0.9h), t));
-
-                // ----- Exact Kerr g-factor for a Keplerian-orbiting emitter. -----
-                // Kerr prograde Keplerian Ω in rs units: Ω = 1 / (√2 r^(3/2) + a),
-                // where a = (a/M)/2 is the dimensional spin in rs units.
-                float a_real    = kerr.a;
-                float r_sqrt    = sqrt(rh);
-                float Omega_K   = 1.0f / (1.41421356f * rh * r_sqrt + a_real);
-                // Equatorial metric components at rh (sin²θ = 1).
-                float gtt_eq    = -(1.0f - 1.0f / rh);
-                float gtphi_eq  = -a_real / rh;
-                float gphph_eq  = (rh * rh + a_real * a_real
-                                   + a_real * a_real / rh);
-                // Emitter's u^t time-component normalization.
-                float U_denom   = -gtt_eq - 2.0f * gtphi_eq * Omega_K - gphph_eq * Omega_K * Omega_K;
-                float Ut        = rsqrt(max(U_denom, 1e-6f));
-                // Photon energy in emitter frame: ω_e = U^t (E − Ω L_z).
-                // The infinity-to-emitter frequency ratio is 1/(U^t (1 − Ω L_z)).
-                float g_factor  = 1.0f / max(Ut * (1.0f - Omega_K * kerr.L), 1e-3f);
-                // Bardeen-Press-Teukolsky g⁴ law (bolometric I_obs/I_emit = g⁴).
-                // Cap to bound HDR spikes at the inner disk limb where the
-                // approaching limb factor diverges.
-                float g4 = min(g_factor * g_factor * g_factor * g_factor, 15.0f);
-
-                // Spectral tint from the Doppler shift (visual flair only).
-                half shift_t   = half(clamp((g_factor - 1.0f) * 1.5f, -1.0f, 1.0f));
-                half3 hot_col  = half3(0.7h, 0.85h, 1.0h);
-                half3 cool_col = half3(1.0h, 0.25h, 0.05h);
-                dCol = mix(dCol, shift_t > 0.0h ? hot_col : cool_col, abs(shift_t) * 0.4h);
-
-                // Volumetric self-shadowing along +y (toward camera approximately).
-                float shadow = 1.0f;
-                if (sys.shadow_int > 0.0f) {
-                    float3 shadow_p = pos_cart;
-                    float shadow_accum = 0.0f;
-                    [[unroll]]
-                    for (int s = 0; s < 2; s++) {
-                        shadow_p += float3(0.0f, 0.2f, 0.0f);
-                        float s_rh = length(float2(shadow_p.x, shadow_p.z));
-                        if (s_rh > r_in && s_rh < r_out && abs(shadow_p.y) < disk_h)
-                            shadow_accum += 0.4f;
-                    }
-                    shadow = exp(-shadow_accum * sys.shadow_int * 5.0f);
-                }
-
-                // Foreshortening — primary image uses the camera-frame angle,
-                // secondary uses the lensed angle (matches the "crossbar" in
-                // every published GRRT visualization).
-                float foreshorten_n_th = (disk_crossings > 0)
-                                        ? abs(s_th * sqrt(max(prev_Th, 0.0f))) / max(r, 1e-3f)
-                                        : init_abs_n_th;
-                float foreshorten = smoothstep(0.0f, 0.25f, foreshorten_n_th);
-                foreshorten = max(foreshorten, 0.005f);
-
-                float step_opacity = clamp(density * dlam * 2.5f * foreshorten, 0.0f, 0.9f);
-                float crossing_boost = 1.0f + min(float(disk_crossings), 3.0f) * 2.0f;
-                col_accum += trans * float3(dCol) * 35.0f * g4 * step_opacity * shadow * crossing_boost;
-                trans *= (1.0f - step_opacity);
+        // ----- Disk-surface intersection (optically thick). -----
+        // The equatorial crossing is the disk's only geometric event; linear
+        // interpolation to the sign change gives sub-step (r, phi) accuracy.
+        // The interpolation factor is valid for BOTH crossing directions
+        // (descending prev_cos > 0 > cos_th and ascending prev_cos < 0 < cos_th):
+        // the denominator |prev_cos| + |cos_th| never vanishes inside this branch.
+        bool just_crossed = (prev_cos * cos_th < 0.0f);
+        if (just_crossed) {
+            crossings++;
+            float f     = clamp(prev_cos / (prev_cos - cos_th), 0.0f, 1.0f);
+            float r_at  = mix(prev_r,  s.r,  f);
+            float ph_at = mix(prev_ph, s.ph, f);
+            if (r_at > r_in && r_at < r_out && sys.disk_density > 0.0f) {
+                float g_here;
+                float3 emis = disk_surface_emission(r_at, kerr, sys, r_in, r_out, g_here);
+                // Higher-order images (n >= 1) are physically demagnified; the
+                // boost slider amplifies them for visibility (0 = physical).
+                int order = crossings - 1;
+                if (order >= 1 && sys.photon_ring_boost > 0.0f)
+                    emis *= (1.0f + sys.photon_ring_boost);
+                col_accum += trans * emis;
+                trans = 0.0f;
+                hit_order = order;
+                hit_g = g_here;
+                fate = 3;
+                (void)ph_at;
+                break;   // optically thick — nothing shines through the disk
             }
         }
 
-        // ----- Near-BH glow + ergosphere shimmer. -----
-        if (r < 5.0f) {
-            float glow = 0.0006f / (r * r);
-            col_accum += trans * float3(0.12f, 0.07f, 0.04f) * glow * 60.0f;
-            trans *= (1.0f - glow);
+        // ----- Near-BH glow + ergosphere shimmer (decorative, faint). -----
+        // Volumetric terms are weighted by the affine step so brightness is a
+        // function of PATH LENGTH, not local step density — the adaptive
+        // controller takes many tiny steps exactly where photons whirl, which
+        // would otherwise overbrighten those rays and change the image
+        // whenever the accuracy constant changes. The 0.06 max(r,1) divisor
+        // reproduces the historical per-step calibration (old fixed policy
+        // dlam = 0.06 r) so no visual retune is needed.
+        float vol_w = dlam / (0.06f * max(s.r, 1.0f));
+        if (s.r < 5.0f) {
+            float glow = 0.0006f / (s.r * s.r);
+            col_accum += trans * float3(0.12f, 0.07f, 0.04f) * glow * 30.0f * vol_w;
+            trans *= (1.0f - min(glow * vol_w, 0.5f));
 
-            // Ergosphere (equatorial static-limit r_E = 1 in rs units for any spin).
             float a_abs = abs(sys.spin);
-            if (a_abs > 0.01f && r < 1.05f && r > r_horizon) {
-                float ergo_depth = (1.05f - r) / (1.05f - r_horizon);
-                float ergo_glow  = ergo_depth * ergo_depth * 0.015f * a_abs;
-                col_accum += trans * float3(0.2f, 0.05f, 0.35f) * ergo_glow * 30.0f;
+            if (a_abs > 0.01f) {
+                float spin2 = sys.spin * sys.spin;
+                float r_E   = 0.5f + 0.5f * sqrt(max(1.0f - spin2 * cos_th * cos_th, 0.0f));
+                if (s.r < r_E && s.r > r_horizon) {
+                    float ergo_depth = (r_E - s.r) / max(r_E - r_horizon, 1e-6f);
+                    float ergo_glow  = ergo_depth * ergo_depth * 0.015f * a_abs;
+                    col_accum += trans * float3(0.2f, 0.05f, 0.35f) * ergo_glow * 5.0f * vol_w;
+                }
             }
         }
 
-        // ----- Polar relativistic jets. -----
-        if (sys.jet_int > 0.0f && r > 1.2f && r < 25.0f) {
-            float cos_axis = abs(cos_th);    // |cos θ| = alignment with spin axis
+        // ----- Polar relativistic jets (decorative). -----
+        if (sys.jet_int > 0.0f && s.r > 1.2f && s.r < 25.0f) {
+            float cos_axis = abs(cos_th);
             if (cos_axis > 0.92f) {
                 float jet_core    = smoothstep(0.92f, 0.98f, cos_axis);
-                float jet_falloff = exp(-r * 0.15f);
-                float sin_ph_j = sin(ph), cos_ph_j = cos(ph);
-                float3 pj      = bl_to_cart(r, sin_th, cos_th, sin_ph_j, cos_ph_j);
+                float jet_falloff = exp(-s.r * 0.15f);
+                float sin_th_j = sqrt(max(1.0f - cos_th * cos_th, 0.0f));
+                float3 pj = bl_to_cart(s.r, sin_th_j, cos_th, sin(s.ph), cos(s.ph));
                 float jet_turb = 0.7f + 0.3f * (float)noise_half(pj * 3.0f + sys.time * 0.5f);
                 float jet_density = jet_core * jet_falloff * jet_turb * 0.08f * sys.jet_int;
                 half3 jet_col  = mix(half3(0.4h, 0.6h, 1.0h), half3(0.8h, 0.9h, 1.0h), half(jet_core));
-                col_accum += trans * float3(jet_col) * 20.0f * jet_density;
-                trans *= (1.0f - jet_density);
+                col_accum += trans * float3(jet_col) * 20.0f * jet_density * vol_w;
+                trans *= (1.0f - min(jet_density * vol_w, 0.5f));
             }
         }
 
-        if (trans < 0.005f) break;
+        if (trans < 0.005f) { fate = 4; break; }   // opaque foreground (jet/glow)
+
+        prev_cos = cos_th;
+        prev_r   = s.r;
+        prev_ph  = s.ph;
     }
 
-    // ----- Background sample at escape using exit direction. -----
-    if (trans > 0.005f) {
-        float cos_th = cos(th);
+    // ----- Background + stars at escape. -----
+    // Budget-exhausted rays (fate 0) are rare pole-skimming or near-critical
+    // orbits; their state is unreliable, so they fall back to the undeflected
+    // camera direction instead of reconstructing a bogus exit direction.
+    float3 exit_dir = rd;
+    if (fate == 2) {
+        float cos_th = cos(s.th);
         float sin_th = sqrt(max(1.0f - cos_th * cos_th, 1e-9f));
-        float sin_ph_e = sin(ph), cos_ph_e = cos(ph);
+        float sin_ph_e = sin(s.ph), cos_ph_e = cos(s.ph);
         float3 r_hat_e, th_hat_e, ph_hat_e;
         bl_basis(sin_th, cos_th, sin_ph_e, cos_ph_e, r_hat_e, th_hat_e, ph_hat_e);
 
-        // Exit momentum signs scaled with √R/√Θ — at large r the spatial
-        // direction in the local frame is (p^r, p^θ·r, p^φ·r·sin θ)/|·|,
-        // which reduces to (s_r√R/Δ, s_th √Θ/r, L_z/(r sin θ)) up to a norm.
-        float Rn  = kerr_R(r, kerr);
-        float Thn = kerr_Theta(cos_th, sin_th, kerr);
-        float Delta_e = max(kerr_Delta(r, kerr.a2, kerr.Q_ch_sq), 1e-6f);
-        float n_r_out  = s_r  * sqrt(max(Rn,  0.0f)) / Delta_e;
-        float n_th_out = s_th * sqrt(max(Thn, 0.0f)) / max(r, 1e-3f);
-        float n_ph_out = kerr.L / max(r * sin_th, 1e-3f);
+        // Local static-frame momentum components at the exit point:
+        //   p^(r)  = sqrt(g_rr) dr/dl ~ Delta p_r / sqrt(Sigma Delta)
+        //   p^(th) = p_th / sqrt(Sigma)
+        //   p^(ph) = L / sqrt(g_phph) ~ L / (r sin th)
+        float Sigma_e = kerr_Sigma(s.r, cos_th, kerr.a2);
+        float Delta_e = max(kerr_Delta(s.r, kerr.a2, kerr.Q2), 1e-6f);
+        float n_r_out  = Delta_e * s.pr / sqrt(max(Sigma_e * Delta_e, 1e-9f));
+        float n_th_out = s.pth / sqrt(Sigma_e);
+        float n_ph_out = kerr.L / max(s.r * sin_th, 1e-3f);
         float norm     = rsqrt(n_r_out * n_r_out + n_th_out * n_th_out + n_ph_out * n_ph_out + 1e-12f);
-        float3 exit_dir = (n_r_out * r_hat_e + n_th_out * th_hat_e + n_ph_out * ph_hat_e) * norm;
+        exit_dir = (n_r_out * r_hat_e + n_th_out * th_hat_e + n_ph_out * ph_hat_e) * norm;
+    }
+    if (fate == 2 || (fate == 0 && trans > 0.005f)) {
+        float cos_th = cos(s.th);
+        float sin_th = sqrt(max(1.0f - cos_th * cos_th, 1e-9f));
+        float sin_ph_e = sin(s.ph), cos_ph_e = cos(s.ph);
+        float3 bg;
+        if (sys.lens_mode == LENS_CHECKER) {
+            bg = checker_sky(exit_dir, cam.camForward.xyz);
+        } else {
+            bg = (float3)sampleBackground_half(exit_dir, sys.time, sys.star_scint, sys.nebula_int);
+        }
 
-        float3 bg = (float3)sampleBackground_half(exit_dir, sys.time, sys.star_scint, sys.nebula_int);
-        for (int j = 0; j < u_obj.count; j++) {
-            if (j == u_obj.bh_index) continue;
-            float3 star_dir = normalize(objs[j].posRadius.xyz - bhPos);
-            float star_dist = length(objs[j].posRadius.xyz - bhPos);
-            float ang_radius = objs[j].posRadius.w / star_dist;
-            float cos_angle  = dot(exit_dir, star_dir);
-            float threshold  = 1.0f - ang_radius * ang_radius * 0.5f;
-            if (cos_angle > threshold) {
-                float solid_angle = ang_radius * ang_radius;
-                float brightness  = min(solid_angle * 800.0f, 4.0f);
-                float limb        = smoothstep(threshold, 1.0f, cos_angle);
-                bg = mix(bg, objs[j].color.xyz * brightness, limb);
+        // Companion stars: straight-ray sphere intersection from the escape
+        // point in world space. Occlusion is inherent (only escaped rays get
+        // here) and lensing comes from the geodesic bending before escape.
+        // Residual deflection beyond the escape radius is O(2 rs / b) — negligible.
+        if (sys.star_bodies != 0 && sys.lens_mode != LENS_CHECKER) {
+            float3 p_esc = bl_to_cart(s.r, sin_th, cos_th, sin_ph_e, cos_ph_e) * rs + bhPos;
+            float best_t = 1e30f;
+            int   best_j = -1;
+            for (int j = 0; j < u_obj.count; j++) {
+                if (j == u_obj.bh_index) continue;
+                float3 oc = objs[j].posRadius.xyz - p_esc;
+                float  t  = dot(oc, exit_dir);
+                if (t <= 0.0f) continue;
+                float d2 = dot(oc, oc) - t * t;
+                float R2 = objs[j].posRadius.w * objs[j].posRadius.w;
+                if (d2 < R2 && t < best_t) { best_t = t; best_j = j; }
+            }
+            if (best_j >= 0) {
+                float3 oc = objs[best_j].posRadius.xyz - p_esc;
+                float d2 = dot(oc, oc) - best_t * best_t;
+                float R2 = objs[best_j].posRadius.w * objs[best_j].posRadius.w;
+                float limb = sqrt(max(1.0f - d2 / R2, 0.0f));        // limb darkening
+                bg = objs[best_j].color.xyz * (0.6f + 1.4f * limb) * 2.0f;
             }
         }
         col_accum += trans * bg;
     }
-    out.write(float4(col_accum, 1.0f), pix);
+
+    // ----- Lens output. -----
+    float3 col = col_accum;
+    if (sys.lens_mode == LENS_RING_ORDER) {
+        // Categorical false color by ray fate / image order (display-linear;
+        // post applies gamma only). Precedent: Gralla-Holz-Wald image
+        // decomposition, EHT photon-ring papers, Bohn et al. fate maps.
+        if      (fate == 1)      col = float3(0.06f, 0.06f, 0.07f);          // captured
+        else if (fate == 4)      col = float3(0.35f, 0.42f, 0.55f);          // absorbed (jet/glow)
+        else if (fate == 3) {
+            float shade = 0.45f + 0.55f * clamp(length(col_accum) * 0.2f, 0.0f, 1.0f);
+            if      (hit_order == 0) col = float3(0.90f, 0.62f, 0.08f) * shade; // direct
+            else if (hit_order == 1) col = float3(0.10f, 0.75f, 0.85f) * shade; // 1st lensed
+            else if (hit_order == 2) col = float3(0.80f, 0.20f, 0.85f) * shade; // 2nd
+            else                     col = float3(0.95f, 0.10f, 0.15f) * shade; // >= 3rd
+        }
+        else                     col = float3(0.02f, 0.03f, 0.10f);          // sky
+    } else if (sys.lens_mode == LENS_REDSHIFT) {
+        if (fate == 3) {
+            // Diverging map centered at g = 1, clamped to [0.4, 1.6].
+            float t = (clamp(hit_g, 0.4f, 1.6f) - 0.4f) / 1.2f;
+            col = diverging_map(t);
+        } else if (fate == 1) col = float3(0.03f);
+        else if (fate == 4)   col = float3(0.10f, 0.12f, 0.16f);   // absorbed foreground
+        else                  col = float3(0.01f, 0.01f, 0.02f);
+    }
+
+    out.write(float4(col, 1.0f), pix);
+}
+
+// --- TEMPORAL ACCUMULATION ---
+//
+// One kernel serves three purposes, selected by sys.accum_alpha (host-set):
+//   camera/params changed  -> alpha = 1        (replace: no ghosting)
+//   camera static          -> alpha = 1/(N+1)  (progressive supersampling of
+//                                               the jittered rays: converges
+//                                               to ground truth in ~64 frames)
+//   moving + motion blur   -> alpha = 1 - blur (exponential trail, in linear
+//                                               HDR so exposure/bloom apply
+//                                               uniformly afterwards)
+kernel void temporal_accum(texture2d<float, access::read> curTex [[texture(0)]],
+                           texture2d<float, access::read> prevTex [[texture(1)]],
+                           texture2d<float, access::write> outTex [[texture(2)]],
+                           constant SystemUniforms& sys [[buffer(0)]],
+                           uint2 pix [[thread_position_in_grid]]) {
+    uint w = outTex.get_width(); uint h = outTex.get_height();
+    if (pix.x >= w || pix.y >= h) return;
+    float3 cur  = curTex.read(pix).rgb;
+    float3 prev = prevTex.read(pix).rgb;
+    // Freshly created private textures have undefined contents; a NaN there
+    // would persist through mix() forever. Sanitize before blending.
+    if (any(isnan(prev)) || any(isinf(prev))) prev = cur;
+    float3 acc = mix(prev, cur, clamp(sys.accum_alpha, 0.0f, 1.0f));
+    outTex.write(float4(acc, 1.0f), pix);
 }
 
 // --- POST-PROCESSING ---
 
+static inline float luma709(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
 kernel void post_process_suite(texture2d<float, access::read> inTex [[texture(0)]],
-                               texture2d<float, access::sample> accumTex [[texture(1)]],
-                               texture2d<float, access::write> outTex [[texture(2)]],
-                               texture2d<float, access::sample> bloomTex [[texture(3)]],
+                               texture2d<float, access::write> outTex [[texture(1)]],
+                               texture2d<float, access::sample> bloomTex [[texture(2)]],
                                constant SystemUniforms& sys [[buffer(0)]],
                                uint2 pix [[thread_position_in_grid]]) {
     uint w = outTex.get_width(); uint h = outTex.get_height();
@@ -557,43 +723,63 @@ kernel void post_process_suite(texture2d<float, access::read> inTex [[texture(0)
     float3 col = inTex.read(pix).rgb;
     float2 uv = (float2(pix) + 0.5f) / float2(w, h);
 
-    // MPS bloom composite (half-res blurred bright regions)
-    if (sys.enable_bloom != 0) {
-        float3 bloom = bloomTex.sample(sampler(filter::linear), uv).rgb;
-        col += bloom * 0.6f;
+    // False-color lenses are display-referred: bypass the photographic chain.
+    if (sys.lens_mode == LENS_RING_ORDER || sys.lens_mode == LENS_REDSHIFT) {
+        outTex.write(float4(pow(max(col, 0.0f), 0.4545f), 1.0f), pix);
+        return;
     }
 
-    // Anamorphic flare — 21-tap horizontal scan; skip the reads when disabled.
+    // EHT observation lens: telescope-beam-blurred luminance through a radio
+    // colormap (the bloom chain carries the beam-convolved image when active).
+    if (sys.lens_mode == LENS_EHT) {
+        float lum = luma709(bloomTex.sample(sampler(filter::linear), uv).rgb) * sys.exposure;
+        float t = lum / (1.0f + lum);          // soft normalize into [0,1)
+        outTex.write(float4(pow(hot_map(t * 1.6f), 0.4545f), 1.0f), pix);
+        return;
+    }
+
+    // Exposure first: everything downstream operates on display-referred light.
+    col *= sys.exposure;
+
+    if (sys.enable_bloom != 0) {
+        float3 bloom = bloomTex.sample(sampler(filter::linear), uv).rgb;
+        col += bloom * 0.6f;                   // extract already applied exposure
+    }
+
     if (sys.flare_int > 0.0f) {
         float flare = 0.0f;
         for (int i=-10; i<=10; i++) {
             uint2 p = uint2(clamp(int(pix.x) + i*4, 0, int(w)-1), pix.y);
-            flare += max(0.0f, dot(inTex.read(p).rgb, float3(0.2126f, 0.7152f, 0.0722f)) - sys.bloom_threshold);
+            flare += max(0.0f, luma709(inTex.read(p).rgb) * sys.exposure - sys.bloom_threshold);
         }
         col += float3(0.1f, 0.3f, 1.0f) * (flare / 21.0f) * sys.flare_int;
     }
 
-    // Auto-exposure
-    col *= sys.exposure;
+    if (sys.vignette_int > 0.0f) {
+        float vignette = 1.0f - 0.4f * sys.vignette_int * dot(uv - 0.5f, uv - 0.5f) * 4.0f;
+        col *= max(vignette, 0.0f);
+    }
 
-    // Motion blur
-    col = mix(col, accumTex.sample(sampler(filter::linear), uv).rgb, sys.motion_blur);
-    col += (hash13(float3(uv * 100.0f, sys.time)) - 0.5f) * sys.film_grain;
-
-
-
-    // Optical Vignette — darken edges like a real lens
-    float vignette = 1.0f - 0.4f * dot(uv - 0.5f, uv - 0.5f) * 4.0f;
-    col *= max(vignette, 0.0f);
-
-    // ACES Filmic Tonemapping
+    // ACES filmic tonemap (Narkowicz fit)
     float a = 2.51f; float b = 0.03f; float c = 2.43f; float d = 0.59f; float e = 0.14f;
     col = clamp((col*(a*col+b))/(col*(c*col+d)+e), 0.0f, 1.0f);
+
+    // Film grain rides on developed density: after the tonemap, scaled by a
+    // photographic sqrt-luminance response (no black-floor lift on empty sky).
+    if (sys.film_grain > 0.0f) {
+        float g = (hash13(float3(uv * 100.0f, sys.time)) - 0.5f) * sys.film_grain;
+        col = clamp(col + g * sqrt(max(luma709(col), 0.0f)), 0.0f, 1.0f);
+    }
+
     outTex.write(float4(pow(col, 0.4545f), 1.0f), pix);
 }
 
-// --- BLOOM EXTRACTION ---
-
+// --- BLOOM / BEAM EXTRACTION ---
+//
+// Standard mode: threshold on the EXPOSED image (so the slider's meaning does
+// not drift with auto-exposure) into a half-res target for the MPS blur.
+// EHT lens: plain downsample (no threshold) — the MPS blur then acts as the
+// telescope's restoring beam.
 kernel void bloom_extract(texture2d<float, access::read> inTex [[texture(0)]],
                           texture2d<float, access::write> outTex [[texture(1)]],
                           constant SystemUniforms& sys [[buffer(0)]],
@@ -601,10 +787,9 @@ kernel void bloom_extract(texture2d<float, access::read> inTex [[texture(0)]],
     uint w = outTex.get_width(); uint h = outTex.get_height();
     if (pix.x >= w || pix.y >= h) return;
 
-    // Disabled: write zero so the subsequent MPS blur sees nothing.
-    if (sys.enable_bloom == 0) { outTex.write(float4(0.0f), pix); return; }
+    bool eht = (sys.lens_mode == LENS_EHT);
+    if (!eht && sys.enable_bloom == 0) { outTex.write(float4(0.0f), pix); return; }
 
-    // Box-sample 2x2 from full-res → half-res
     uint2 src = pix * 2;
     uint sw = inTex.get_width(); uint sh = inTex.get_height();
     float3 c0 = inTex.read(min(src, uint2(sw-1, sh-1))).rgb;
@@ -613,21 +798,22 @@ kernel void bloom_extract(texture2d<float, access::read> inTex [[texture(0)]],
     float3 c3 = inTex.read(min(src + uint2(1,1), uint2(sw-1, sh-1))).rgb;
     float3 avg = (c0 + c1 + c2 + c3) * 0.25f;
 
-    float3 bloom = max(avg - sys.bloom_threshold, 0.0f);
+    if (eht) { outTex.write(float4(avg, 1.0f), pix); return; }
+
+    avg *= sys.exposure;
+    // Luminance-relative threshold preserves hue (no per-channel clipping).
+    float lum = luma709(avg);
+    float over = max(lum - sys.bloom_threshold, 0.0f);
+    float3 bloom = (lum > 1e-6f) ? avg * (over / lum) : float3(0.0f);
     outTex.write(float4(bloom, 1.0f), pix);
 }
 
 // --- AUTO-EXPOSURE LUMINANCE ANALYSIS ---
 //
-// Dispatched at (W/4) × (H/4) — each thread samples one pixel out of every
-// 4×4 block. Per-thread results are summed across the SIMD group with
-// simd_sum, so we issue at most one atomic per simdgroup (32× fewer than
-// per-thread atomics on Apple Silicon).
-//
-// Encoding: log2 luminance ∈ [-10, 10] → [0, 2000] as fixed-point ×100.
-// At a 4K-equivalent active-thread count (~520k), 520k × 2000 = 1.04e9
-// stays well under uint32 max (4.29e9). The previous ×1000 encoding
-// overflowed on Retina framebuffers.
+// Mean of log2 luminance, one sample per 4x4 block, simd-summed so each
+// simdgroup issues at most one atomic. Pixels below the floor (empty sky)
+// are EXCLUDED from the average — flooring them at 0.001 used to drag the
+// mean so low that exposure pegged at its clamp and clipped the disk white.
 kernel void luminance_reduce(texture2d<float, access::read> inTex [[texture(0)]],
                              device atomic_uint* lumBuffer [[buffer(0)]],
                              uint2 pix [[thread_position_in_grid]],
@@ -638,11 +824,12 @@ kernel void luminance_reduce(texture2d<float, access::read> inTex [[texture(0)]]
     uint encoded = 0u;
     uint count = 0u;
     if (src.x < w && src.y < h) {
-        float3 col = inTex.read(src).rgb;
-        float lum = dot(col, float3(0.2126f, 0.7152f, 0.0722f));
-        float log_lum = log2(max(lum, 0.001f));
-        encoded = uint(clamp((log_lum + 10.0f) * 100.0f, 0.0f, 2000.0f));
-        count = 1u;
+        float lum = luma709(inTex.read(src).rgb);
+        if (lum >= 0.001f) {
+            float log_lum = log2(lum);
+            encoded = uint(clamp((log_lum + 12.0f) * 100.0f, 0.0f, 2400.0f));
+            count = 1u;
+        }
     }
 
     uint sum_simd = simd_sum(encoded);
@@ -654,26 +841,63 @@ kernel void luminance_reduce(texture2d<float, access::read> inTex [[texture(0)]]
 }
 
 // --- N-BODY PHYSICS ---
+//
+// Velocity-Verlet (kick-drift-kick) leapfrog with a FIXED physics timestep
+// (sys.dt_phys, host-substepped): integration accuracy is independent of
+// frame rate, and a stalled frame can no longer kick a star onto an escape
+// orbit. Two dispatches per substep because all positions must commit before
+// any body evaluates the new acceleration.
 
-kernel void update_physics(device SimObject* objects [[buffer(0)]], constant ObjectsUniform& u [[buffer(1)]], constant SystemUniforms& sys [[buffer(2)]], uint id [[thread_position_in_grid]]) {
-    if (id >= (uint)u.count || objects[id].mass > 1e35f) return;
-    float dt = 2500000.0f * sys.dt_sim;
-    float G = 6.67430e-11f;
-    float eps = 1e9f;
+static inline float3 nbody_acceleration(uint id, const device SimObject* objects, int count) {
+    constexpr float G   = 6.67430e-11f;
+    constexpr float eps = 1e9f;
     float3 p = objects[id].posRadius.xyz;
-    float3 v = objects[id].velocity.xyz;
-    float3 f = float3(0.0f);
-    for (int i=0; i<u.count; i++) {
+    float3 a = float3(0.0f);
+    for (int i = 0; i < count; i++) {
         if (i == (int)id) continue;
         float3 r_v = objects[i].posRadius.xyz - p;
         float r2 = dot(r_v, r_v);
-        f += normalize(r_v) * (G * objects[i].mass / (r2 + eps * eps));
+        a += normalize(r_v) * (G * objects[i].mass / (r2 + eps * eps));
     }
-    v += f * dt;
-    p += v * dt;
-    objects[id].velocity.xyz = v;
-    objects[id].posRadius.xyz = p;
+    return a;
 }
+
+kernel void physics_init_accel(device SimObject* objects [[buffer(0)]],
+                                constant ObjectsUniform& u [[buffer(1)]],
+                                uint id [[thread_position_in_grid]]) {
+    if (id >= (uint)u.count) return;
+    if (objects[id].mass > 1e35f) {
+        objects[id].acceleration.xyz = float3(0.0f);   // BH stays fixed
+        return;
+    }
+    objects[id].acceleration.xyz = nbody_acceleration(id, objects, u.count);
+}
+
+kernel void physics_drift(device SimObject* objects [[buffer(0)]],
+                          constant ObjectsUniform& u [[buffer(1)]],
+                          constant SystemUniforms& sys [[buffer(2)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id >= (uint)u.count || objects[id].mass > 1e35f) return;
+    float dt = sys.dt_phys;
+    float3 p = objects[id].posRadius.xyz;
+    float3 v = objects[id].velocity.xyz;
+    float3 a = objects[id].acceleration.xyz;
+    objects[id].posRadius.xyz = p + v * dt + 0.5f * a * (dt * dt);
+}
+
+kernel void physics_force_kick(device SimObject* objects [[buffer(0)]],
+                                constant ObjectsUniform& u [[buffer(1)]],
+                                constant SystemUniforms& sys [[buffer(2)]],
+                                uint id [[thread_position_in_grid]]) {
+    if (id >= (uint)u.count || objects[id].mass > 1e35f) return;
+    float dt = sys.dt_phys;
+    float3 a_old = objects[id].acceleration.xyz;
+    float3 a_new = nbody_acceleration(id, objects, u.count);
+    objects[id].velocity.xyz += 0.5f * (a_old + a_new) * dt;
+    objects[id].acceleration.xyz = a_new;
+}
+
+// --- SPACETIME GRID (embedding diagram) ---
 
 struct VertexOut { float4 position [[position]]; float depth; };
 struct VertexIn { float3 position [[attribute(0)]]; };
@@ -694,16 +918,15 @@ vertex VertexOut grid_vertex(VertexIn in [[stage_in]], constant GridUniforms& u 
         bool is_bh = o[i].mass > 1e35f;
 
         if (is_bh) {
-            // BH: deep conical funnel — 1/r potential with softening
             total_depression += BH_WELL_DEPTH * BH_SOFTENING / sqrt(d * d + BH_SOFTENING * BH_SOFTENING);
         } else if (o[i].mass > 1e28f) {
-            // Stars: gentle dimple bowls scaled by mass ratio
             float star_soft = max(o[i].posRadius.w * 3.0f, 5.0e12f);  // floor prevents tubes
             float mass_ratio = o[i].mass / 12.0e30f;
             total_depression += STAR_WELL_DEPTH * mass_ratio * star_soft / sqrt(d * d + star_soft * star_soft);
         }
 
-        // Gravitational wave ripples
+        // Stylised quadrupole-pattern ripple: decorative sin(kr − ωt)·cos(2φ),
+        // NOT a strain solution — amplitude/wavelength chosen for legibility.
         if (sys.gw_amp > 0.0f && o[i].mass > 1e28f) {
             float mass_scale = is_bh ? 1.0f : 0.08f;
             float phase = d * 1e-11f - sys.time * 2.0f;
@@ -713,14 +936,8 @@ vertex VertexOut grid_vertex(VertexIn in [[stage_in]], constant GridUniforms& u 
         }
     }
 
-    // The well curves DOWNWARD — p.y decreases near masses
     p.y -= total_depression;
-
-    // Normalized depth for coloring (0 = flat, 1 = deepest)
     float well_depth = clamp(total_depression / BH_WELL_DEPTH, 0.0f, 1.0f);
-
-    // Place flat grid just below the BH equatorial plane
-    // BH sits at the RIM of the funnel
     p.y -= GRID_BASELINE;
     out.position = u.viewProj * float4(p, 1.0f);
     out.depth = well_depth;
@@ -728,31 +945,29 @@ vertex VertexOut grid_vertex(VertexIn in [[stage_in]], constant GridUniforms& u 
 }
 
 fragment float4 grid_fragment(VertexOut in [[stage_in]],
-                              texture2d<float, access::sample> sceneTex [[texture(0)]]) {
+                              texture2d<float, access::sample> sceneTex [[texture(0)]],
+                              constant SystemUniforms& sys [[buffer(0)]]) {
     float d = in.depth;  // 0 = flat surface, 1 = deep in gravity well
-    
-    // CRITICAL: flat grid lines (d ≈ 0) MUST be fully discarded.
+
+    // CRITICAL: flat grid lines (d ≈ 0) MUST be fully discarded — alpha
+    // stacking of hundreds of near-flat lines otherwise forms an opaque band.
     if (d < 0.008f) discard_fragment();
-    
-    // Check the scene behind this fragment — don't draw grid over BH/stars/disk
+
+    // Scene occlusion: hide the grid behind anything bright. The scene texture
+    // is pre-exposure HDR, so scale by the live exposure to keep the visible
+    // threshold stable across auto-exposure states.
     float2 screen_uv = in.position.xy / float2(sceneTex.get_width(), sceneTex.get_height());
     constexpr sampler s(filter::linear);
-    float3 scene = sceneTex.sample(s, screen_uv).rgb;
-    float scene_lum = dot(scene, float3(0.2126f, 0.7152f, 0.0722f));
-    if (scene_lum > 0.05f) discard_fragment();  // hide grid behind bright objects
-    
-    // Color gradient: bright cyan → electric blue-purple → hot orange-red
+    float scene_lum = dot(sceneTex.sample(s, screen_uv).rgb, float3(0.2126f, 0.7152f, 0.0722f));
+    if (scene_lum * sys.exposure > 0.05f) discard_fragment();
+
     float3 col = mix(float3(0.15f, 0.8f, 1.0f),
                      float3(0.5f, 0.2f, 1.0f),
                      smoothstep(0.0f, 0.3f, d));
     col = mix(col,
               float3(1.0f, 0.3f, 0.05f),
               smoothstep(0.3f, 0.75f, d));
-    
-    // Emissive HDR boost
     col *= 1.5f + d * 1.5f;
-    
-    // Alpha ramps with depth
     float alpha = smoothstep(0.008f, 0.06f, d) * mix(0.5f, 0.9f, d);
     return float4(col, alpha);
 }

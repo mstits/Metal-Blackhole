@@ -1,282 +1,304 @@
 # Rendering Invariants & Lessons Learned
 
-Hard-won rules from debugging the equatorial band artifact and validating physics accuracy.
-**Violating any of these will reintroduce visual bugs.**
+Hard-won rules from debugging the geodesic integrator, the temporal pipeline,
+and the coordinate singularities. **Violating any of these will reintroduce
+visual or physics bugs.** Every invariant below is enforced or cross-checked by
+`tests/validate_physics.py` (83 tests) where a test can express it.
 
 ---
 
-## Invariant Dependency Map
+## 1. Geodesic Integrator
 
-The invariants are interconnected — violating one often cascades into multiple artifacts:
+### INVARIANT: Trace the PAST-directed ray (E = −1), never the time-reverse
 
-```mermaid
-graph TD
-    A["Step Size Clamping<br/>§1"] -->|"Exhausted budget → dark line"| E["Equatorial Band<br/>Artifact"]
-    B["Foreshortening<br/>§2"] -->|"cos²θ → dark band"| E
-    C["Event Horizon<br/>§3"] -->|"col_accum leak → warm tint"| F["Shadow Contamination"]
-    D["Bloom Gate<br/>§4"] -->|"Always-on bloom → glow ring"| E
-    G["Beaming Cap<br/>§4"] -->|"Uncapped D⁴ → HDR spikes"| D
-    H["Grid Discard<br/>§5"] -->|"Alpha stacking → opaque band"| I["Grid Band Artifact"]
-    J["Full Resolution<br/>§1"] -->|"Half-res → star bleed"| K["Disk Gaps"]
-    L["Math Mode<br/>§6"] -->|"Fast math → corrupt geodesics"| M["Disk Disappears"]
+The pixel's light ARRIVES at the camera; the backward ray is the past-directed
+continuation of the arriving momentum, normalized to `E = −p_t = −1` with the
+ZAMO denominator `α − ω_z √g_φφ n_φ`. A future-directed `E = +1` ray launched
+along the view direction is the TIME-REVERSED photon: identical in
+Schwarzschild (t → −t is an isometry there), but MIRRORED in Kerr — it flips
+the sign of every `aL` coupling, so the shadow's flattened (prograde) side
+lands on the side opposite the Doppler-approaching limb, which is physically
+impossible (both are corotation effects and must coincide).
 
-    style E fill:#450a0a,stroke:#ef4444,color:#fff
-    style F fill:#450a0a,stroke:#ef4444,color:#fff
-    style I fill:#450a0a,stroke:#ef4444,color:#fff
-    style K fill:#450a0a,stroke:#ef4444,color:#fff
-    style M fill:#450a0a,stroke:#ef4444,color:#fff
+Regression: TEST 13 asserts the flattening/approaching pairing; the measured
+rendered shadow extends 2.1× farther on the receding side (Bardeen: 2.4×,
+partially disk-covered). The photon impact ratio for shading is `ξ = L/E = −L`.
+
+### INVARIANT: Evolve momenta, never track √R / √Θ signs
+
+The integrator uses the super-Hamiltonian first-order form on
+`(r, θ, φ, p_r, p_θ)`. The classic `Σ dr/dλ = ±√R` root-tracking form has a
+fatal failure mode: when an RK4 step lands past a turning point, `√(max(R,0))`
+is identically zero in the forbidden region, so the coordinate freezes there
+**permanently** — every ray with a radial or polar turning point stalls at
+periapsis instead of turning around. The momentum form passes through turning
+points smoothly (p_r crosses zero like any ODE variable).
+
+Regression: validate_physics TEST 5 — rays at b = 3…10 rs must pass through
+periapsis, re-escape, and reproduce Darwin's exact deflection to ~1e-5.
+
+### INVARIANT: The step controller must include the p_θ stiffness term
+
+```metal
+float rate = fabs(d.r) / max(s.r, 0.5f) + fabs(d.th) / min(pole_dist, 1.0f)
+           + fabs(d.pth) / (fabs(s.pth) + 1.0f)      // DO NOT REMOVE
+           + fabs(d.ph) * sin_th_rate + 1e-9f;
 ```
+
+Near-axis rays hit a *stiff* polar turning point: `|dθ/dλ|` vanishes exactly at
+the turn while the `L²/sin³θ` wall kicks `p_θ` impulsively. Without the
+`|dp_θ|` term the controller sails through the impulse, the θ-phase corrupts,
+and every later equatorial-crossing radius is wrong — visible as a dotted
+column of false disk hits along the projected spin axis.
+
+### INVARIANT: Polar-cap φ bypass
+
+Inside `θ < 0.01` of the axis, `dφ/dλ` is numerically meaningless (BL
+coordinate singularity with a clamped `1/sin²θ` integrand). The kernel freezes
+φ at cap entry and applies the exact through-the-pole jump of π at exit. This
+is exact in spherical symmetry and O(a·0.01) for Kerr. Do not "simplify" by
+integrating φ through the cap.
+
+### INVARIANT: Crossing interpolation must be valid for BOTH directions
+
+```metal
+// CORRECT — denominator |prev_cos| + |cos_th| never vanishes in this branch
+float f = clamp(prev_cos / (prev_cos - cos_th), 0.0f, 1.0f);
+
+// WRONG — max() destroys the sign for ascending crossings and silently
+// discards every disk hit from below the equator
+float f = prev_cos / max(prev_cos - cos_th, 1e-9f);
+```
+
+Regression: TEST 12 — a camera below the disk plane must see the disk.
+
+### INVARIANT: Kerr-Newman charge enters EVERY metric coefficient
+
+`2Mr → r − Q²` (rs units) in `g_tt`, `g_tφ`, `g_φφ` of the camera tetrad AND
+the disk emitter — not only in `Δ`. A tetrad that is charge-aware in `g_rr`
+(via Δ) but Kerr-only elsewhere is not orthonormal in the metric the ray is
+propagated in, and biases `L_z`/`Q_C` per pixel.
+
+Regression: TESTs 1, 6, 10 (KN horizons, RN photon sphere/capture, KN Ω).
 
 ---
 
-## 1. Ray Integration Step Size
+## 2. Redshift & Beaming
 
-### INVARIANT: Adaptive step clamping must be bounded by BOTH position AND radius
+### INVARIANT: The emitter g-factor uses the photon impact ratio ξ = L/E = −L
 
-```metal
-// CORRECT — bounded by position (y < disk_h*3) AND radius (r < r_out*1.2)
-if (abs(pos.y) < disk_h3 && r < r_out * 1.2f) {
-    float cross_speed = min(abs(vel.y) * 10.0f, 1.0f);
-    float dt_clamp = mix(0.4f, 0.06f, cross_speed);
-    dt = min(dt, dt_clamp);
-}
-
-// WRONG — no radius check; exhausts 1200-iteration budget at r=50+
-if (abs(pos.y) < disk_h3) dt = min(dt, 0.06f);
-```
-
-**Why:** At r=50, the default step is `50 × 0.06 = 3.0`. Clamping to 0.06 is 50× smaller. A ray
-traversing from r=50 outward needs `450/0.06 = 7500` steps — far exceeding the 1200 budget.
-Rays that exhaust iterations produce partial/dark output, creating a visible line at y=0.
-
-### INVARIANT: Edge-on rays need LARGER step clamps than disk-crossing rays
-
-Edge-on rays (vel.y ≈ 0) travel parallel to the disk slab and don't need fine vertical resolution.
-They stay inside the disk slab continuously. Forcing dt=0.06 on these rays wastes the iteration
-budget. Use `mix(0.4, 0.06, cross_speed)` where cross_speed scales with abs(vel.y).
-
-### INVARIANT: Do NOT use a vel.y threshold for step clamping
+With the past-directed congruence the traced conserved `L` (for `E = −1`)
+relates to the photon's impact ratio as `ξ = −L`:
 
 ```metal
-// WRONG — creates a sharp brightness discontinuity at vel.y = 0.01
-if (abs(vel.y) > 0.01f) dt = min(dt, 0.06f);
+kerr.L_arr = -kerr.L;                                   // xi = L/E
+g = 1.0f / max(Ut * (1.0f - Omega * kerr.L_arr), 1e-3f);
 ```
 
-Rays at vel.y = 0.009 get large steps (miss disk). Rays at vel.y = 0.011 get tiny steps
-(sample disk correctly). This creates a 1-pixel-wide brightness boundary at the equatorial plane.
+Using the raw traced `L` here inverts the Doppler asymmetry — the approaching
+limb dims and the receding limb brightens, which is wrong in the most
+recognizable feature of every published black hole image.
 
-### INVARIANT: Raytrace must run at FULL resolution
+Regression: TEST 7 — end-to-end first-principles check that the approaching
+limb has g > 1.
 
-Half-res causes sub-pixel thin disk to bleed stars through. The disk is geometrically thin
-(disk_h = 0.6 rs), so even 2× downsampling creates gaps.
+### INVARIANT: Doppler color is a temperature shift, not an RGB tint
+
+A shifted blackbody is exactly another blackbody at `T_obs = g·T_emit`. Color
+must come from the Planck-locus LUT at `T_obs`; intensity from `Fn·g⁴`
+(bolometric Liouville), capped at 15 to keep the approaching inner limb inside
+tonemap range. An RGB lerp toward "hot"/"cool" colors cannot move along the
+Planckian locus and reads as tinting, not physics.
+
+### INVARIANT: No emission from spacelike orbits
+
+If `U_denom = −g_tt − 2g_tφΩ − g_φφΩ² ≤ 0` the circular orbit is spacelike
+(inside the sense-appropriate photon orbit) — return zero emission. Clamping
+`U_denom` and emitting produces clamp noise, not physics. With the signed-spin
+ISCO branches feeding `r_in` this region is normally never sampled; the guard
+is the backstop.
 
 ---
 
-## 2. Disk Emission Foreshortening
+## 3. Retrograde Spin & Volumetric Accumulation
 
-### INVARIANT: Use smoothstep, not cos²(θ), for geometric foreshortening
+### INVARIANT: The ISCO branch must match the disk's rotation sense
 
-```metal
-// CORRECT — gradual ramp over ~14°
-float foreshorten = smoothstep(0.0f, 0.25f, vy);
-foreshorten = max(foreshorten, 0.005f);
+The disk always rotates in +φ. For `spin < 0` it is retrograde relative to the
+hole: `kerr_radii()` must select the **retrograde** BPT branch (`+root`), which
+is up to 7× larger than the prograde one (9M vs 1M at extremal spin). Using
+`|a|` with the prograde branch anchors the disk deep inside the region where
+counter-rotating circular orbits do not exist.
 
-// WRONG — drops too steeply: 0.04 at 11° to 0.0025 at 3°
-float foreshorten = abs_vy * abs_vy;  // cos²(θ)
-```
+Regression: TEST 2 (retrograde values, exact 9M limit).
 
-cos²(θ) creates a dark band at the equatorial plane because the brightness drops 16× between
-11° and 3° viewing angle. smoothstep provides a gradual, artifact-free transition.
+### INVARIANT: Volumetric emission is weighted by the affine step
 
-### INVARIANT: Dual-mode foreshortening — init_abs_vy for primary, abs(vel.y) for lensed
+Glow, ergosphere shimmer, and jet contributions accumulate as
+`emissivity · vol_w` with `vol_w = dlam / (0.06 · max(r, 1))`, and attenuate
+`trans` likewise. Per-STEP accumulation under the adaptive controller makes
+brightness proportional to local step density — photon-shell whirl rays take
+hundreds of tiny steps and glow ~2× brighter every time the accuracy constant
+is halved. The `0.06·r` divisor reproduces the historical calibration of the
+old fixed-step policy, so brightness is step-invariant without a retune.
 
-```metal
-float init_abs_vy = abs(vel.y);  // Store BEFORE the integration loop
-// ... inside loop:
-// Primary disk image: use initial camera angle (prevents photon-ring bright line)
-// Secondary+ images: use current ray angle (enables gravitationally lensed crossbar)
-float foreshorten_vy = (disk_crossings > 0) ? abs(vel.y) : init_abs_vy;
-float foreshorten = smoothstep(0.0f, 0.25f, foreshorten_vy);
-```
+### INVARIANT: Capture keeps foreground emission
 
-**Why dual-mode?** The crossbar (lensed far-side disk image) is formed by rays deflected
-~180° by gravity. At the secondary crossing, the ray hits the disk at a steep angle
-(`vel.y ≈ 0.9`) regardless of the original camera direction. Using `init_abs_vy` for
-these rays suppresses the crossbar by 3-25× at edge-on viewing angles — making the
-most iconic feature of GRRT visualizations effectively invisible.
+On horizon capture: `trans = 0` (the fate gate keeps the background out) but
+`col_accum` is KEPT — jet and glow light accumulated between the camera and
+the horizon is real foreground emission. Zeroing it notches the jet where it
+crosses the shadow. (Safe only together with the step-weighted accumulation
+above; per-step glow would flood the shadow.)
 
-Using `abs(vel.y)` for the primary image is still wrong (creates the equatorial bright line),
-so we keep `init_abs_vy` for `disk_crossings == 0`.
+### Ray fates
 
----
-
-## 3. Event Horizon & Shadow
-
-### INVARIANT: Zero BOTH trans AND col_accum when ray enters horizon
-
-```metal
-// CORRECT — no light escapes from inside the event horizon
-if (r < r_horizon * 1.01f) { trans = 0.0f; col_accum = float3(0.0f); break; }
-
-// WRONG — accumulated disk glow leaks through as a brownish tint in the shadow
-if (r < r_horizon * 1.01f) { trans = 0.0f; break; }
-```
-
-Rays that orbit the photon sphere accumulate disk emission from secondary crossings before
-plunging in. If only `trans` is zeroed, the previously accumulated `col_accum` is still output,
-creating a warm tint inside what should be a pure-black shadow.
+`0` budget-exhausted (falls back to the undeflected direction), `1` captured,
+`2` escaped, `3` disk hit, `4` absorbed in foreground media (jet/glow at
+`trans < 0.005`). The lenses color 4 distinctly — conflating it with the sky
+would falsely label the optically-thick jet cone in the image-order map.
 
 ---
 
-## 4. Post-Processing Pipeline
+## 4. Temporal Pipeline
 
-### INVARIANT: Bloom threshold must be 999.0 (not 1.0) when disabled
-
-HDR raytraced values regularly exceed 10.0 (beaming × 35 = huge values). A threshold of 1.0
-still passes many pixels into the bloom pipeline, where MPS Gaussian blur spreads them into
-a visible equatorial glow band.
-
-### INVARIANT: Bloom composite must be gated behind a threshold check
-
-```metal
-// CORRECT — only composite when bloom is actually enabled
-if (sys.bloom_threshold < 100.0f) {
-    float3 bloom = bloomTex.sample(sampler(filter::linear), uv).rgb;
-    col += bloom * 0.6f;
-}
-
-// WRONG — always adds bloom even when "disabled"
-float3 bloom = bloomTex.sample(sampler(filter::linear), uv).rgb;
-col += bloom * 0.6f;
-```
-
-### INVARIANT: Doppler beaming must be capped at 15×
-
-The D⁴ beaming factor diverges at the inner disk limb where `cos_v × v_orbit → 1`.
-Without capping, values reach 300×+, creating extreme HDR spikes that overwhelm tonemapping.
-
----
-
-## 5. Grid Rendering
-
-### INVARIANT: Grid lines at depth < 0.008 must use discard_fragment()
-
-Alpha-blending hundreds of near-flat grid lines creates an opaque band:
-`(1 - 0.03)^400 ≈ 0%` background transmission → fully opaque.
-
-Use `discard_fragment()` for flat lines so only gravitationally curved portions are visible.
-
-### INVARIANT: Grid fragments must be discarded where scene objects are present
-
-The grid renders as a separate render pass ON TOP of the raytraced scene. Without
-scene-occlusion checking, grid lines render through the BH shadow, accretion disk,
-and stars — breaking the illusion that the grid is "below" the scene.
-
-**Fix:** The grid fragment shader samples the HDR scene texture and discards any
-fragment where `scene_luminance > 0.05`. This makes the grid invisible behind bright
-objects, creating the correct visual hierarchy: BH/disk/stars in front, grid behind.
-
-```metal
-// Scene-occlusion check in grid_fragment
-float3 scene = sceneTex.sample(s, screen_uv).rgb;
-float scene_lum = dot(scene, float3(0.2126, 0.7152, 0.0722));
-if (scene_lum > 0.05) discard_fragment();
-```
-
-**Do NOT remove this check** — it is the only thing preventing grid lines from
-appearing inside the BH shadow and through the accretion disk.
-
-### Grid Gravity Well Parameters
-
-The grid is an **embedding diagram** — a 2D visualization of spacetime curvature.
-Wells use fixed visual depths calibrated to the grid extent (±200e12):
-
-| Object | Well Depth | Softening | Notes |
-|--------|-----------|-----------|-------|
-| Black Hole | 25e12 | 15e12 | Gentle funnel, ~6% of grid extent |
-| Stars | 5e12 | max(3×radius, 5e12) | Proportional to mass |
-| Grid Baseline | 1.5e12 | — | Below BH equatorial plane |
-
----
-
-## 6. Compiler & Precision
-
-### INVARIANT: Must use MTLMathModeRelaxed, NOT MTLMathModeFast
+### INVARIANT: Auto-exposure reads the slot the semaphore guarantees complete
 
 ```objc
-// CORRECT — IEEE-compliant sqrt/division for geodesic accuracy
-compileOpts.mathMode = MTLMathModeRelaxed;
-
-// WRONG — approximate sqrt/division corrupts geodesic integration
-compileOpts.mathMode = MTLMathModeFast;
+// CORRECT — this slot was last written by GPU frame N-3 (semaphore depth 3)
+uint32_t* lumData = (uint32_t*)lumBuffer[currentFrame].contents;  // read BEFORE memset
+// WRONG — slot (currentFrame+1)%3 belongs to frame N-2, which may not have
+// executed yet when the GPU runs 2+ frames behind: the CPU reads only its own
+// memset zeros and exposure never converges
 ```
 
-Fast math uses approximate reciprocal sqrt and division instructions. For the geodesic
-integrator, these approximations compound over 1200 steps, causing the accretion disk to
-disappear at edge-on viewing angles where precision is critical.
+### INVARIANT: Metering excludes sub-floor pixels
+
+Pixels with luminance < 0.001 (empty sky) are **excluded** from the log-average
+— not floored. Flooring them drags the mean so low that exposure pegs at its
+clamp and the disk clips to white.
+
+### INVARIANT: Accumulation must sanitize its history
+
+Freshly created private textures have undefined contents; a NaN there persists
+through `mix()` forever. `temporal_accum` replaces non-finite history with the
+current frame before blending.
+
+### INVARIANT: Bounded history while ANY raytraced content animates
+
+Companion stars sweep pixels per frame; jet turbulence, star twinkle, and
+nebula drift all consume `sys.time` inside the accumulated raytrace pass. A
+deep accumulator freezes them into a temporal mean, so `accum_alpha` is
+floored at 0.1 whenever any of them is animating.
+
+### INVARIANT: Never blend into invalid history; no jitter without history
+
+After `createResources()` the accumulation textures hold undefined memory:
+the motion-blur alpha override is gated on `accumHistoryValid`, which resize
+clears. And when history is being REPLACED (`alpha ≈ 1`, camera moving), the
+subpixel jitter is zeroed — uncompensated jitter just makes high-contrast
+edges crawl during interaction.
 
 ---
 
-## 7. Physics Accuracy Checklist
+## 5. Post-Processing
 
-### Schwarzschild (a=0) Reference Values
+- **Exposure first.** Bloom extraction, flare thresholding, and the grid's
+  scene-occlusion test all operate on *exposed* values so their thresholds mean
+  the same thing at any auto-exposure state.
+- **Bloom threshold along luminance**, scaling the color, never per-channel
+  `max()` — per-channel clipping shifts bloom hue.
+- **Film grain after the tonemap**, scaled by √luminance. Grain added in linear
+  HDR before ACES is half-wave rectified on black sky (lifts blacks).
+- **False-color lenses bypass the photographic chain** (exposure, bloom, ACES);
+  they are display-referred data visualizations and get gamma only.
+- **The CAMetalLayer colorspace is set to sRGB** to match the manual gamma
+  encode; without it, wide-gamut displays oversaturate everything.
 
-| Feature | Expected Value | Source |
-|---------|---------------|--------|
-| Event Horizon | r = 1.0 rs | Schwarzschild metric |
-| Photon Sphere | r = 1.5 rs | Null geodesic condition |
-| Shadow Radius | b = √27/2 ≈ 2.598 rs | Critical impact parameter |
-| ISCO | r = 3.0 rs | Circular orbit stability |
-| Disk T(r) | T ∝ r^(-3/4) × (1−√(rᵢₛₒ/r))^(1/4) | Novikov-Thorne |
-| Redshift | g = √(1 − 1.5/r) | Circular orbit redshift |
-| Shadow Interior | Pure black (RGB = 0,0,0) | No light escapes horizon |
-| Polar Doppler | ~Zero (all v ⊥ LOS) | Orbital v in disk plane |
+---
 
-### Kerr Spin-Dependent Values
+## 6. Grid Rendering
 
-| Feature | a=0 | a=0.5 | a=0.9 | a=0.998 |
-|---------|-----|-------|-------|---------|
-| Horizon (r₊) | 1.000 | 0.933 | 0.718 | 0.532 |
-| ISCO (prograde) | 3.000 | 2.117 | 1.160 | 0.540 |
-| ZAMO ω at r=2 | 0.0 | 0.057 | 0.086 | 0.091 |
+### INVARIANT: Flat grid lines (depth < 0.008) use discard_fragment()
 
-### Automated Validation
+Alpha-blending hundreds of near-flat lines forms an opaque band
+(`(1-0.03)^400 ≈ 0` transmission).
 
-Run the physics test suite to verify all values:
+### INVARIANT: Scene occlusion tests EXPOSED luminance
 
-```bash
-python3 tests/validate_physics.py
-# Expected: 47 passed, 0 failed
+```metal
+if (scene_lum * sys.exposure > 0.05f) discard_fragment();
 ```
+
+The scene texture is pre-exposure HDR; a fixed threshold on raw values makes
+grid occlusion drift with auto-exposure.
+
+---
+
+## 7. Compiler & Precision
+
+### INVARIANT: One precision policy on BOTH shader compile paths — relaxed, never fast
+
+- Runtime path: `MTLMathModeRelaxed` (macOS 15+); pre-15 falls back to
+  `fastMathEnabled = NO`, which is strictly SAFER (the deprecated API has no
+  relaxed setting).
+- Offline path: `scripts/build_metallib.sh` passes `-fmetal-math-mode=relaxed`
+  (or `-fno-fast-math`, strictly safer, on older toolchains).
+
+Be precise about what relaxed means: it PERMITS non-IEEE sqrt/division while
+preserving Inf/NaN — it is not "IEEE-compliant fast math" (no Metal mode is).
+It is a deliberate 3× performance trade-off: the fp64 mirror suite certifies
+the algorithm, and A/B captures against `MTLMathModeSafe` show sub-1% mean
+pixel differences. Full fast math (`MTLMathModeFast`) remains FORBIDDEN — it
+additionally flushes NaN and reassociates aggressively, and historically made
+the disk vanish at edge-on angles. If the metallib toolchain disappears, the
+build script deletes any stale metallib so the app cannot silently prefer an
+outdated binary over freshly edited source.
+
+### INVARIANT: ARC on the Objective-C++ sources
+
+`src/main.mm` and `imgui_impl_metal.mm` are written ARC-style. Compiled without
+`-fobjc-arc` every implied release is a no-op: ~100 MB leaked per window
+resize, plus per-frame ImGui transients. The flag is per-source in
+CMakeLists.txt.
+
+### INVARIANT: Shader edits must be dependency-tracked
+
+The metallib + fallback-copy commands use `add_custom_command(OUTPUT … DEPENDS
+shaders/geodesic.metal include/ShaderCommon.h …)`. POST_BUILD commands only run
+on relink, which silently serves stale shaders after `make`.
 
 ---
 
 ## 8. Diagnostic Tools
 
-- **P key**: Saves framebuffer to `/tmp/bh_diag_<frame>.ppm` via Metal blit readback
-- **Auto-capture template** (add to render loop for QA):
-  ```objc
-  if (frameCount == 30) camera.elevation = 1.5707f;  // edge-on
-  if (frameCount == 40) screenshotPending = true;
-  ```
-- **PPM → PNG conversion**: `sips -s format png file.ppm --out file.png`
-- **Debug ray script**: `python3 debug_ray.py` — traces a single ray through the disk to diagnose emission accumulation
+- **P key**: capture the framebuffer (PPM, `O_CREAT|O_EXCL|O_NOFOLLOW`).
+- **QA harness**: `BH_QA=1` renders 100 frames with input ignored, captures
+  frame 90, exits at 100. `BH_ELEV/BH_AZIM/BH_SPIN/BH_CHARGE/BH_LENS/
+  BH_BEAMING/BH_OVERLAYS/BH_SHOT_DIR` select the scenario — the basis for
+  reproducible visual regression captures.
+- **PPM → PNG**: `sips -s format png file.ppm --out file.png`
+- **Physics suite**: `python3 tests/validate_physics.py` (83 tests, fp64 mirror
+  of the shader integrator — including a leg at the exact shipped GPU step
+  constants and a through-the-pole continuation test).
+- **Critical-curve overlay**: doubles as a live validation — the rendered
+  shadow edge must land on Bardeen's analytic curve at any spin/charge/
+  inclination.
 
 ---
 
 ## Quick Reference: What NOT to Change
 
-```mermaid
-flowchart LR
-    subgraph DANGER ["🚫 Do NOT Modify"]
-        A["dt_clamp = 0.06<br/>(disk step size)"]
-        B["max(foreshorten, 0.005)<br/>(0.5% floor)"]
-        C["col_accum = float3(0)<br/>(horizon kill)"]
-        D["bloom_threshold = 999<br/>(disabled state)"]
-        E["min(beaming, 15.0)<br/>(D⁴ cap)"]
-        F["MTLMathModeRelaxed<br/>(compiler mode)"]
-        G["Full-res raytrace<br/>(no half-res)"]
-    end
-
-    style DANGER fill:#450a0a,stroke:#ef4444,color:#fff
-```
+| Guard | Why |
+|-------|-----|
+| `E = −1` past-directed congruence (`α − ω√g_φφ n_φ` denominator) | Kerr frame-dragging handedness |
+| `vol_w = dlam/(0.06·max(r,1))` on glow/ergo/jet | step-density-invariant volumetrics |
+| `fabs(d.pth)/(fabs(s.pth)+1)` in the step controller | resolves stiff polar turning points |
+| Polar-cap φ freeze + π jump | BL axis singularity |
+| `clamp(prev_cos/(prev_cos - cos_th), 0, 1)` | below-plane disk visibility |
+| `kerr.L_arr` in the g-factor (never `kerr.L`) | Doppler asymmetry sign |
+| `U_denom <= 1e-6 → no emission` | spacelike-orbit guard |
+| Signed-spin ISCO/photon branches in `kerr_radii()` | retrograde disks |
+| `lumBuffer[currentFrame]` read before memset | exposure convergence |
+| `min(g⁴, 15)` | HDR cap for tonemapping |
+| Fast-math-off on both compile paths | geodesic precision |
+| `-fobjc-arc` on the .mm sources | memory leaks |

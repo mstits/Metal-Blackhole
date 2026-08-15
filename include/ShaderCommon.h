@@ -20,6 +20,7 @@ struct SimObject {
     float  mass;
     float  _pad0[3];
     VEC4   velocity;
+    VEC4   acceleration;    // velocity-Verlet leapfrog scratch; xyz used, w unused
 };
 
 struct CameraData {
@@ -29,31 +30,51 @@ struct CameraData {
     VEC4   camForward;
     float  tanHalfFov;
     float  aspect;
-    int    moving;
-    int    _pad4;
+    float  _pad[2];
 };
+
+// Lens modes (SystemUniforms::lens_mode). Non-Standard lenses are mutually
+// exclusive false-color remappings; overlays and physics switches compose.
+#define LENS_STANDARD    0
+#define LENS_RING_ORDER  1   // categorical color by image order n (equatorial crossings)
+#define LENS_REDSHIFT    2   // diverging colormap of the g-factor at the first disk hit
+#define LENS_CHECKER     3   // procedural lat-long checkerboard sky (lensing map)
+#define LENS_EHT         4   // telescope-beam Gaussian blur + radio colormap
+
+// Beaming modes (SystemUniforms::beaming_mode).
+#define BEAM_FULL        0   // g^4 intensity + temperature shift (physical)
+#define BEAM_NO_BOOST    1   // temperature shift only (color, no intensity change)
+#define BEAM_NONE        2   // no shift, no boost (Luminet-style bolometric render)
 
 struct SystemUniforms {
     float time;
-    float spin;
+    float spin;             // a/M in [-1, 1]; negative = retrograde disk
     float star_scint;
     float nebula_int;
-    float charge;
-    float dt_sim;
+    float charge;           // Q/M in [0, 1], jointly clamped so a^2 + Q^2 <= 1
+    float dt_phys;          // N-body physics substep in seconds (fixed, host-substepped)
     float bloom_threshold;
     float flare_int;
     float motion_blur;
     float film_grain;
     float disk_density;
-    float disk_height;
-    float shadow_int;
+    float disk_r_out;       // disk outer radius in rs units
+    float disk_temp;        // Novikov-Thorne peak temperature in Kelvin
+    float vignette_int;     // 0 = off
     float gw_amp;
     float exposure;
     float jet_int;
-    float r_horizon;        // Kerr event horizon (rs units), CPU-precomputed from spin
-    float r_isco;           // Kerr ISCO prograde (rs units), CPU-precomputed from spin
+    float r_horizon;        // Kerr-Newman outer horizon (rs units), from spin AND charge
+    float r_isco;           // ISCO (rs units): prograde for spin >= 0, retrograde for spin < 0
+    float photon_ring_boost;// 0 = physical; >0 amplifies image orders n >= 1
+    float accum_alpha;      // temporal blend weight: 1 = replace, <1 = accumulate
+    float jitter_x;         // subpixel jitter in [-0.5, 0.5] (Halton, per frame)
+    float jitter_y;
+    float _padf;
     int   enable_bloom;     // 0 = bloom pipeline contributes nothing; 1 = active
-    int   _pad_sys;
+    int   lens_mode;        // LENS_* above
+    int   beaming_mode;     // BEAM_* above
+    int   star_bodies;      // 1 = render + lens the N-body companion stars
 };
 
 struct ObjectsUniform {
