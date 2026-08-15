@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)   # OBJCXX became a first-class language in 3.16
 project(MetalBlackhole LANGUAGES CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -28,7 +28,13 @@ add_executable(MetalBlackhole
     ${IMGUI_DIR}/backends/imgui_impl_metal.mm
 )
 
-target_include_directories(MetalBlackhole PRIVATE 
+# The Objective-C++ sources are written in ARC style; without -fobjc-arc every
+# implied release is a no-op and the app leaks per frame and per resize.
+# Per-source (not target-wide) so the plain C++ ImGui units are untouched.
+set_source_files_properties(src/main.mm ${IMGUI_DIR}/backends/imgui_impl_metal.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+
+target_include_directories(MetalBlackhole PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
@@ -50,21 +56,22 @@ target_compile_options(MetalBlackhole PRIVATE
     -fstack-protector-strong
 )
 
-# Precompile shaders to .metallib (faster startup, no GPU code injection risk)
-add_custom_command(TARGET MetalBlackhole POST_BUILD
-    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_metallib.sh
-        ${CMAKE_CURRENT_SOURCE_DIR}/include/ShaderCommon.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/geodesic.metal
-        $<TARGET_FILE_DIR:MetalBlackhole>
-    COMMENT "Compiling Metal shaders to geodesic.metallib"
-)
+# Shader pipeline: dependency-tracked so `make` after editing the shader
+# actually refreshes the metallib AND the runtime-compile fallback copies.
+# (POST_BUILD commands only ran on relink, silently serving stale shaders.)
+set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shaders/geodesic.metal)
+set(SHADER_HDR ${CMAKE_CURRENT_SOURCE_DIR}/include/ShaderCommon.h)
 
-# Also copy source files as fallback for development/debugging
-add_custom_command(TARGET MetalBlackhole POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/geodesic.metal
-    $<TARGET_FILE_DIR:MetalBlackhole>/geodesic.metal
-    COMMAND ${CMAKE_COMMAND} -E copy
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/ShaderCommon.h
-    $<TARGET_FILE_DIR:MetalBlackhole>/ShaderCommon.h
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/geodesic.metal ${CMAKE_BINARY_DIR}/ShaderCommon.h
+    BYPRODUCTS ${CMAKE_BINARY_DIR}/geodesic.metallib
+    COMMAND ${CMAKE_COMMAND} -E copy ${SHADER_SRC} ${CMAKE_BINARY_DIR}/geodesic.metal
+    COMMAND ${CMAKE_COMMAND} -E copy ${SHADER_HDR} ${CMAKE_BINARY_DIR}/ShaderCommon.h
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_metallib.sh
+        ${SHADER_HDR} ${SHADER_SRC} ${CMAKE_BINARY_DIR}
+    DEPENDS ${SHADER_SRC} ${SHADER_HDR} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_metallib.sh
+    COMMENT "Compiling Metal shaders (metallib + runtime fallback copies)"
 )
+add_custom_target(shaders ALL
+    DEPENDS ${CMAKE_BINARY_DIR}/geodesic.metal ${CMAKE_BINARY_DIR}/ShaderCommon.h)
+add_dependencies(MetalBlackhole shaders)

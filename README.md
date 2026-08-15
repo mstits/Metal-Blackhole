@@ -1,6 +1,6 @@
 # Metal Blackhole
 
-A high-fidelity, real-time black hole simulation optimized for Apple Silicon via the Metal API. This project implements general relativity geodesics, volumetric plasma physics, and cinematic post-processing to create a physically authentic and visually stunning representation of a Kerr-Newman black hole.
+A high-fidelity, real-time black hole visualization and learning tool for Apple Silicon via the Metal API. The engine integrates exact Kerr-Newman null geodesics per pixel, renders a Novikov-Thorne thin disk with physically-correct blackbody Doppler color, and includes a set of toggleable **learning lenses** — the same alternative visualizations researchers use in papers (photon-ring image orders, redshift maps, checkerboard lensing skies, EHT beam convolution) — validated against an 83-test analytic GR suite.
 <img width="1312" height="940" alt="blackhole_screenshot" src="https://github.com/user-attachments/assets/98ee9e2e-913c-41ba-a067-f5cb44b1712f" />
 
 ---
@@ -8,6 +8,7 @@ A high-fidelity, real-time black hole simulation optimized for Apple Silicon via
 ## Table of Contents
 
 - [Technical Highlights](#technical-highlights)
+- [Learning Mode](#learning-mode)
 - [Architecture](#architecture)
 - [GPU Rendering Pipeline](#gpu-rendering-pipeline)
 - [Physics Model](#physics-model)
@@ -24,41 +25,58 @@ A high-fidelity, real-time black hole simulation optimized for Apple Silicon via
 ## Technical Highlights
 
 ### Core Physics & Metrics
-- **Kerr-Newman Metric:** Support for mass, angular momentum (Spin `a`), and electric charge (Charge `Q`).
-- **RK4 Geodesic Solver:** 4th-Order Runge-Kutta integration of the effective gravitational potential with gravitomagnetic (Lense-Thirring) frame dragging — the same formulation used by DNEG for *Interstellar*.
-- **Dimensionless Units:** Refactored mathematics (`r/rs`) to maintain numerical stability at any scale.
-- **N-Body Gravity:** GPU-accelerated Newtonian solver for orbiting companion stars.
-- **Spectral Doppler Shift:** Color temperature shifts from orbital velocity — approaching limb blue-shifts, receding limb red-shifts.
+- **Exact Kerr-Newman Metric:** Boyer-Lindquist coordinates, full mass + spin (`a`) + charge (`Q`). The charge enters every metric coefficient — the geodesic potentials, the camera tetrad, and the disk emitter — not just `Δ`.
+- **Super-Hamiltonian Geodesic Integrator:** Carter-separated potentials with the momenta `(p_r, p_θ)` evolved by Hamilton's equations. Unlike the common `±√R, ±√Θ` root-tracking form, this passes smoothly through radial and polar turning points — the same choice the *Interstellar* renderer (DNGR) made for exactly this reason.
+- **Past-Directed Backward Rays:** Each pixel traces the past-directed continuation of the *arriving* photon (`E = −1`), not its time-reverse — identical in Schwarzschild but essential in Kerr, where the time-reversed congruence mirrors every frame-dragging asymmetry and pairs the shadow's flattened side with the wrong Doppler side.
+- **Adaptive RK4 Stepping:** Inverse-sum step controller (RAPTOR-style) with pole-proximity scaling and a stiffness term that resolves near-axis polar turning points. Coarse in the far field, fine where photons whirl near the photon shell.
+- **ZAMO Camera Tetrad:** Zero-angular-momentum-observer frame, regular inside the ergosphere, with the full Kerr-Newman `g_tt`, `g_tφ`, `g_φφ` coefficients.
+- **Signed Spin / Retrograde Disks:** `a < 0` renders a counter-rotating disk anchored at the **retrograde** ISCO (9M at extremal spin, vs 1M prograde), with a validity guard that emits nothing from spacelike orbits.
+- **N-Body Gravity:** GPU velocity-Verlet leapfrog (KDK) at a **fixed physics timestep** (host-substepped), so orbital accuracy is independent of frame rate.
+- **Dimensionless Units:** Length scale `rs = 2M`, with `M = ½` so `Δ = r² − r + a² + Q²` stays numerically well-conditioned.
 
 ### Rendering & Optics
-- **Volumetric Accretion Torus:** 5-octave spatiotemporal fBM noise simulating turbulent plasma.
-- **Relativistic Effects:** Accurate Doppler beaming (`D⁴`) and gravitational redshift.
-- **Novikov-Thorne Disk:** Temperature profile with zero-torque ISCO boundary condition.
-- **Volumetric Self-Shadowing:** Secondary ray-marching for realistic internal occlusion.
-- **Star Lensing:** Dynamic lensing and smearing of companion stars through curved spacetime.
-- **Photon Rings:** Primary, secondary (half-orbit), and higher-order gravitationally focused images.
-- **Gravitational Waves:** Quadrupole ripple visualization on the spacetime manifold grid.
-- **Polar Relativistic Jets:** Collimated blue-white emission along the spin axis with turbulent noise.
-- **Ergosphere Glow:** Faint violet emission inside the static limit surface for spinning black holes.
+- **Optically-Thick Novikov-Thorne Disk:** Page-Thorne flux `F ∝ (r_in/r)³(1 − √(r_in/r))` — zero at the ISCO (zero-torque boundary condition), peak at `(49/36) r_in`.
+- **Physical Doppler Color:** A shifted blackbody is exactly another blackbody at `T_obs = g·T_emit`. The disk color comes from a baked Planck-spectrum → CIE → sRGB lookup, so the approaching limb genuinely turns blue-white and the receding limb red — no RGB tinting.
+- **Correct Beaming Sign:** The g-factor is evaluated with the *arriving* photon's angular momentum (the backward-traced ray carries the opposite `L_z`), so the approaching limb brightens as `g⁴` — verified end-to-end by the test suite.
+- **Photon Rings from Geodesics:** Higher-order images emerge naturally from the integrator; the Photon Ring Boost slider (0 = physical) amplifies `n ≥ 1` images for visibility.
+- **Companion Stars with Occlusion:** N-body stars are sphere-intersected in world space from the ray's escape point — occluded by the disk and horizon, lensed by the geodesic bending, limb-darkened.
+- **Temporal Accumulation AA:** Per-frame Halton subpixel jitter accumulates into a progressive supersample whenever the camera is static (reference-quality stills in ~64 frames); bounded history while the N-body animation runs.
+- **Polar Relativistic Jets, Ergosphere Shimmer** (decorative, clearly gated).
 
 ### Cinematic Suite
-- **ACES Filmic Tonemapping:** Hollywood-standard color science.
-- **MPS Bloom:** MetalPerformanceShaders Gaussian blur for cinematic glow around bright regions.
-- **Anamorphic Lens Flare:** Procedural horizontal streaks from high-intensity sources.
-- **Auto-Exposure:** GPU-computed log-luminance histogram with temporal smoothing.
-- **Optical Vignette:** Edge darkening for natural lens falloff.
-- **Motion Blur:** Temporal feedback loops for shutter-accurate trails.
-- **Film Grain:** 70mm grain simulation.
+- **ACES Filmic Tonemapping** with exposure applied before all display-referred effects.
+- **Auto-Exposure:** Mean log-luminance metering that excludes empty sky, targeting middle gray.
+- **MPS Bloom** with a hue-preserving, exposure-consistent luminance threshold.
+- **Anamorphic Flare, Vignette (toggleable), Film Grain** (applied after the tonemap, luminance-scaled, as real grain behaves).
+- **Motion Blur** as an exponential accumulation in linear HDR.
 
 ### Performance (Apple Silicon Optimized)
-- **Triple Buffering:** Zero CPU-GPU synchronization stalls via `dispatch_semaphore`.
-- **Precompiled `.metallib`:** Offline shader compilation for instant startup (graceful fallback to runtime compilation).
-- **MTLMathModeRelaxed:** FMA-enabled compilation with IEEE-compliant sqrt/division for geodesic accuracy.
-- **SIMD-Aligned Threadgroups:** 32×8 threadgroups aligned with Apple Silicon's 32-wide execution width.
-- **Non-Uniform Dispatch:** `dispatchThreads` for hardware-managed boundary handling.
-- **Adaptive Integration:** Euler for weak-field (`r > 8`), RK4 for strong-field — 1 vs 4 force evaluations per step.
-- **Half-Precision (FP16):** Disk color computation at 2× ALU throughput.
-- **Double-Buffered Intermediates:** Eliminates per-frame blit copy for motion blur accumulation.
+- **Triple Buffering** with a race-free auto-exposure readback (reads the slot the semaphore guarantees complete).
+- **Precompiled `.metallib`** (dependency-tracked in the build; falls back to runtime compilation) with one consistent precision policy on both paths: relaxed math (Inf/NaN preserved), a documented 3× performance trade-off over safe math; full fast math is forbidden.
+- **Adaptive stepping** typically converges rays in a few hundred steps; ~40+ fps at 2400×1600 on Apple Silicon.
+- **SIMD-Reduced Metering:** one atomic per simdgroup.
+- **ARC enabled** on the Objective-C++ sources (no per-frame leaks).
+
+---
+
+## Learning Mode
+
+The **Learning** panel switches the renderer between the visualizations the research community actually uses. Lenses are exclusive full-screen remappings; overlays and physics switches stack on top of any lens.
+
+| Kind | Control | What it teaches | Precedent |
+|------|---------|------------------|-----------|
+| Lens | **Standard** | The photographic image | Luminet 1979, DNGR |
+| Lens | **Image order** | False-color by equatorial crossing count: n=0 direct, n=1 lensed far-side/underside, n=2 photon ring | Gralla-Holz-Wald 2019, EHT photon-ring papers |
+| Lens | **Redshift map** | Diverging blue-white-red map of `g = E_obs/E_emit` at the first disk hit | Standard GRRT paper figure |
+| Lens | **Checkerboard sky** | Lat-long checkerboard background exposes pure lensing; repeated patches = image orders | DNGR paint-swatch test, Bohn et al. |
+| Lens | **EHT view** | Image convolved with a telescope restoring beam (FWHM slider in rs) through a radio colormap | EHT Paper IV |
+| Switch | **Doppler/beaming** | Full `g⁴` / color-shift-only (the *Interstellar* convention) / off (Luminet bolometric) | DNGR Fig. 15 decomposition |
+| Overlay | **Orbit markers** | Coordinate-space horizon, ergosphere, photon orbit, ISCO circles | Outreach "anatomy" diagrams |
+| Overlay | **Critical curve** | Bardeen's analytic shadow boundary drawn over the live image — the rendered shadow edge must land on it | Bardeen 1973, EHT Paper VI |
+| Overlay | **Geodesic fan** | 2D equatorial panel: parallel rays deflecting, orbiting, and being captured | Textbook figures, Müller's teaching tools |
+| Overlay | **Spacetime grid** | Embedding-diagram gravity well (star-system scale) | Standard outreach visual |
+
+Press **L** to cycle lenses. Every false-color lens draws its own colorbar legend and caption.
 
 ---
 
@@ -69,171 +87,90 @@ graph TD
     subgraph Host ["CPU Host (main.mm)"]
         GLFW["GLFW Window + Input"]
         CAM["Camera (Orbital)"]
-        IMGUI["ImGui Control Panel"]
+        IMGUI["ImGui Control Panel<br/>+ Learning overlays"]
         UNI["Uniform Upload<br/>(Triple-Buffered)"]
+        FAN["Geodesic-fan CPU mirror<br/>Bardeen critical curve"]
     end
 
     subgraph GPU ["Metal GPU Pipeline"]
-        FLUID["Fluid Simulation<br/>(Advection Kernel)"]
-        PHYS["N-Body Physics<br/>(Newtonian Gravity)"]
-        RAY["Geodesic Raytracer<br/>(RK4 + Euler)"]
-        BLOOM_EX["Bloom Extraction<br/>(Half-Res)"]
+        PHYS["N-Body Physics<br/>(fixed-dt substeps)"]
+        RAY["Geodesic Raytracer<br/>(Hamiltonian RK4, adaptive)"]
+        TA["Temporal Accumulation<br/>(jitter supersampling)"]
+        BLOOM_EX["Bloom / EHT-beam Extract"]
         MPS["MPS Gaussian Blur"]
-        LUM["Luminance Reduction<br/>(Auto-Exposure)"]
-        POST["Post-Processing Suite<br/>(ACES + Bloom + Flare)"]
-        GRID["Grid Renderer<br/>(Spacetime Manifold)"]
+        LUM["Luminance Metering"]
+        POST["Post-Processing<br/>(exposure → bloom → ACES)"]
+        GRID["Grid Renderer"]
     end
 
-    subgraph Output ["Display"]
-        DRAW["CAMetalLayer Drawable"]
-    end
-
-    GLFW --> CAM
-    GLFW --> IMGUI
-    CAM --> UNI
+    GLFW --> CAM --> UNI
     IMGUI --> UNI
-    UNI --> FLUID
-    UNI --> PHYS
-    UNI --> RAY
-    FLUID --> RAY
-    PHYS --> RAY
-    RAY --> BLOOM_EX
-    RAY --> LUM
-    BLOOM_EX --> MPS
-    MPS --> POST
-    LUM --> POST
-    RAY --> POST
-    POST --> DRAW
+    FAN --> IMGUI
+    UNI --> PHYS --> RAY
+    RAY --> TA --> BLOOM_EX --> MPS --> POST
+    TA --> LUM --> POST
+    TA --> POST
+    POST --> DRAW(("Present"))
     GRID --> DRAW
     IMGUI --> DRAW
-
-    style Host fill:#1a1a2e,stroke:#e94560,color:#eee
-    style GPU fill:#0f3460,stroke:#00d2ff,color:#eee
-    style Output fill:#16213e,stroke:#0f3460,color:#eee
 ```
 
 ---
 
 ## GPU Rendering Pipeline
 
-Each frame dispatches the following compute and render passes in order:
+Each frame dispatches, in order:
 
-```mermaid
-flowchart LR
-    A["1. Fluid Sim<br/>1024×1024<br/>Disk turbulence"] --> B["2. N-Body Physics<br/>per-object<br/>Gravity solver"]
-    B --> C["3. Geodesic Raytrace<br/>Full resolution<br/>1200 steps/ray"]
-    C --> D["4. Bloom Extract<br/>Half resolution<br/>Threshold filter"]
-    D --> E["5. MPS Blur<br/>σ = 8.0<br/>Gaussian bloom"]
-    C --> F["6. Luminance<br/>Every 4th pixel<br/>Log₂ accumulate"]
-    E --> G["7. Post-Process<br/>Bloom + Flare<br/>ACES Tonemap"]
-    F --> G
-    C --> G
-    G --> H["8. Grid Render<br/>120×120 mesh<br/>Gravity well"]
-    H --> I["9. ImGui<br/>Control panel<br/>Physics readouts"]
-    I --> J(("Present<br/>Drawable"))
+1. **N-Body physics** — velocity-Verlet substeps at fixed `dt ≈ 9.3e4 s` (frame-rate independent).
+2. **Geodesic raytrace** — full resolution, jittered, adaptive steps, → raw HDR.
+3. **Temporal accumulation** — replace / progressive-supersample / motion-blur EMA, selected by camera state.
+4. **Bloom or EHT-beam extraction** (half res) + **MPS Gaussian blur**.
+5. **Luminance metering** (1 sample per 4×4 block, simd-summed, sky excluded).
+6. **Post-processing** — exposure → bloom → flare → vignette → ACES → grain → sRGB gamma. False-color lenses bypass the photographic chain.
+7. **Grid render + overlays + ImGui.**
 
-    style A fill:#2d1b69,stroke:#8b5cf6,color:#fff
-    style B fill:#1e3a5f,stroke:#3b82f6,color:#fff
-    style C fill:#7c2d12,stroke:#f97316,color:#fff
-    style D fill:#4a1942,stroke:#c084fc,color:#fff
-    style E fill:#4a1942,stroke:#c084fc,color:#fff
-    style F fill:#1a4731,stroke:#22c55e,color:#fff
-    style G fill:#78350f,stroke:#f59e0b,color:#fff
-    style H fill:#1e3a5f,stroke:#3b82f6,color:#fff
-    style I fill:#374151,stroke:#9ca3af,color:#fff
-    style J fill:#064e3b,stroke:#10b981,color:#fff
+### Raytracer Detail
+
+Per pixel: decompose the jittered camera ray in the ZAMO tetrad → conserved `(E=1, L_z, Q_C)` and initial momenta `(p_r, p_θ)` → adaptive RK4 on `(r, θ, φ, p_r, p_θ)`:
+
+```
+dr/dλ   = Δ p_r / Σ
+dθ/dλ   = p_θ / Σ
+dφ/dλ   = [a(r − Q²) − a²L]/(ΔΣ) + L/(Σ sin²θ)
+dp_r/dλ = [(R/Δ)' − Δ' p_r²] / (2Σ)
+dp_θ/dλ = [−2a² sinθ cosθ + 2L² cosθ/sin³θ] / (2Σ)
 ```
 
-### Raytracer Detail (Step 3)
-
-The core raytracer integrates photon trajectories backward from the camera through curved spacetime:
-
-```mermaid
-flowchart TD
-    START["Camera Ray Origin<br/>ro = camPos, rd = pixel direction"] --> INIT["Initialize in BH coordinates<br/>pos = (ro - bhPos) / rs<br/>vel = rd"]
-    INIT --> LOOP{"Integration Loop<br/>i < 1200"}
-
-    LOOP -->|"r < r_horizon"| HORIZON["Event Horizon Hit<br/>trans = 0, col = black<br/>BREAK"]
-    LOOP -->|"r > 500 or<br/>r > 30 & outbound"| EXIT["Exit: Sample Background<br/>Stars + Nebula via<br/>deflected exit vel"]
-    LOOP -->|Continue| DT["Adaptive Step Size<br/>dt = max(r × 0.06, 0.001)<br/>+ disk proximity clamp"]
-
-    DT --> INTEGRATE{"r > 8?"}
-    INTEGRATE -->|"Yes (weak field)"| EULER["Euler Step<br/>1 force eval"]
-    INTEGRATE -->|"No (strong field)"| RK4["RK4 Step<br/>4 force evals"]
-
-    EULER --> DISK{"In Disk Slab?<br/>|y| < disk_h<br/>r_in < rh < r_out"}
-    RK4 --> DISK
-
-    DISK -->|Yes| EMIT["Accumulate Emission<br/>• NT Temperature T(r)<br/>• Doppler beaming D⁴<br/>• Gravitational redshift<br/>• Foreshortening<br/>• Self-shadowing<br/>• Photon ring boost"]
-    DISK -->|No| GLOW{"r < 5?"}
-
-    EMIT --> LOOP
-    GLOW -->|Yes| ERGO["BH Glow + Ergosphere"] --> LOOP
-    GLOW -->|No| JET{"In Jet Cone?<br/>cos θ > 0.92"} -->|Yes| JETEMIT["Jet Emission"] --> LOOP
-    JET -->|No| LOOP
-
-    HORIZON --> OUT["Output float4(col, 1)"]
-    EXIT --> OUT
-
-    style HORIZON fill:#450a0a,stroke:#ef4444,color:#fff
-    style EXIT fill:#052e16,stroke:#22c55e,color:#fff
-    style RK4 fill:#7c2d12,stroke:#f97316,color:#fff
-    style EULER fill:#1e3a5f,stroke:#3b82f6,color:#fff
-    style EMIT fill:#78350f,stroke:#f59e0b,color:#fff
-```
+with `R(r) = P² − Δ[(L−a)² + Q_C]`, `P = r² + a² − aL`, `Σ = r² + a²cos²θ`, `Δ = r² − r + a² + Q²`. Turning points cost nothing — the momenta pass smoothly through zero. Equatorial crossings are detected by the sign flip of `cos θ` and interpolated to sub-step accuracy (valid for both crossing directions, so the disk renders correctly from below the plane). Disk hits terminate the ray (optically thick); escaped rays reconstruct a local exit direction for sky and star sampling. A polar-cap bypass handles the Boyer-Lindquist axis singularity exactly (φ jumps by π through the pole).
 
 ---
 
 ## Physics Model
 
-### Geodesic Equation
-
-The engine uses an effective gravitational potential with a gravitomagnetic perturbation to simulate photon propagation through Kerr spacetime:
-
-```mermaid
-graph LR
-    subgraph Schwarzschild ["Schwarzschild Term"]
-        S["a⃗ = −1.5 |h⃗|² p⃗ / r⁵"]
-    end
-    subgraph Charge ["Reissner-Nordström Term"]
-        Q["a⃗ += Q² p⃗ / r⁴"]
-    end
-    subgraph FrameDrag ["Frame Dragging (Lense-Thirring)"]
-        FD["J⃗ = (0, a/2, 0)<br/>B⃗ = (3p⃗(p⃗·J⃗)/r² − J⃗) / r³<br/>a⃗ += 4(v⃗ × B⃗)"]
-    end
-    S --> ACC["Total Acceleration"]
-    Q --> ACC
-    FD --> ACC
-    ACC --> INT["RK4 / Euler<br/>Integration"]
-
-    style Schwarzschild fill:#1a1a2e,stroke:#e94560,color:#eee
-    style Charge fill:#16213e,stroke:#00d2ff,color:#eee
-    style FrameDrag fill:#0f3460,stroke:#8b5cf6,color:#eee
-    style ACC fill:#78350f,stroke:#f59e0b,color:#fff
-    style INT fill:#064e3b,stroke:#10b981,color:#fff
-```
-
-### Accretion Disk Model
+### Accretion Disk
 
 | Property | Formula | Source |
 |----------|---------|--------|
-| Inner Edge | `r_in = max(r_isco, r_horizon × 1.2)` | Bardeen (1972) |
-| Emissivity | `F ∝ (r_in/r)³` | Shakura-Sunyaev |
-| Temperature | `T ∝ r^(-3/4) × (1 − √(r_in/r))^(1/4)` | Novikov-Thorne |
-| Orbital Velocity | `v = √(1/r) + ω_fd × r` | Keplerian + ZAMO |
-| ZAMO Frequency | `ω = a / (r³ + a²r + a²)` | Exact Kerr |
-| Doppler Beaming | `D⁴ = 1 / (1 − v⃗·r̂)⁴`, capped at 15× | Relativistic invariant |
-| Gravitational Redshift | `g = √(1 − 3/(2r) + a/r^(3/2))` | Kerr circular orbit |
+| Inner Edge | `r_in = max(r_isco, 1.2 r_+)`, signed-spin ISCO branch | Bardeen-Press-Teukolsky (1972) |
+| Flux | `F ∝ (r_in/r)³ (1 − √(r_in/r))` — zero at ISCO, peak at `(49/36) r_in` | Page-Thorne |
+| Temperature | `T = T_peak · F_norm^(1/4)` | Novikov-Thorne |
+| Circular-orbit Ω | `Ω = √(Mr − Q²) / (r² + a√(Mr − Q²))`, signed `a` | Kerr-Newman circular geodesics |
+| Emitter `U^t` | `1/√(−g_tt − 2g_tφΩ − g_φφΩ²)` (KN coefficients), no emission if spacelike | Four-velocity normalization |
+| g-factor | `g = 1/(U^t(1 − Ω L_arr))` with `L_arr` the **arriving** photon's `L_z` | Cunningham 1975 |
+| Observed color | Blackbody at `T_obs = g·T` via Planck×CIE LUT | Liouville / DNGR |
+| Observed intensity | `F_norm · min(g⁴, 15)` (bolometric; cap keeps HDR in tonemap range) | Liouville invariant |
+| Static Limit | `r_E(θ) = M + √(M² − a²cos²θ)` | Kerr |
 
-### Spin-Dependent GR Parameters
+### Spin/Charge-Dependent Structure (rs units)
 
-| Feature | Schwarzschild (a=0) | Kerr (a=0.9) | Extreme Kerr (a→1) |
-|---------|---------------------|--------------|---------------------|
-| Event Horizon (r₊) | 1.000 rs | 0.718 rs | 0.500 rs |
-| ISCO (prograde) | 3.000 rs | 1.160 rs | 0.500 rs |
-| Photon Sphere | 1.500 rs | — | — |
-| Shadow Radius | 2.598 rs | — | — |
-| Ergosphere | None | r < 1.0 rs | r < 1.0 rs |
+| Feature | a=0 | a=0.9 | a=0.998 | a=−0.9 (retro) | Q=0.5 (RN) |
+|---------|-----|-------|---------|----------------|------------|
+| Horizon r₊ | 1.000 | 0.718 | 0.532 | 0.718 | 0.933 |
+| ISCO | 3.000 | 1.160 | 0.540 | **4.359** | 3.000* |
+| Photon orbit | 1.500 | 0.778 | 0.536 | 1.955 | **1.411** |
+| Shadow b_c | 2.598 | 1.42–3.42 | D-shaped | mirrored | 2.484 |
+
+*Kerr ISCO used for charged holes (documented approximation, floored at 1.2 r₊).
 
 ---
 
@@ -242,47 +179,20 @@ graph LR
 ```
 metal_blackhole/
 ├── src/
-│   └── main.mm                  # Application entry, Metal engine, ImGui panel
+│   └── main.mm                  # Metal engine, ImGui panel, overlays, N-body scene
 ├── shaders/
-│   └── geodesic.metal           # All GPU kernels (raytrace, fluid, post, physics, grid)
+│   └── geodesic.metal           # All GPU kernels (raytrace, accumulate, post, physics, grid)
 ├── include/
-│   ├── ShaderCommon.h           # Shared CPU/GPU struct definitions
+│   ├── ShaderCommon.h           # Shared CPU/GPU struct definitions + lens/beaming enums
 │   └── Camera.h                 # Orbital camera controller
 ├── scripts/
-│   └── build_metallib.sh        # Offline shader precompilation
+│   └── build_metallib.sh        # Offline shader precompilation (fast math off)
 ├── tests/
-│   └── validate_physics.py      # 47-test physics validation suite
-├── libs/
-│   └── imgui/                   # Dear ImGui (vendored)
+│   └── validate_physics.py      # 71-test physics validation suite (fp64 shader mirror)
+├── libs/imgui/                  # Dear ImGui (vendored)
 ├── RENDERING_INVARIANTS.md      # Critical shader invariants & lessons learned
-├── CMakeLists.txt               # Build configuration
-└── README.md                    # This file
-```
-
-### Source File Map
-
-```mermaid
-graph TD
-    subgraph CPU ["Host (C++ / Obj-C++)"]
-        MAIN["main.mm<br/>━━━━━━━━━━━━━━━━━<br/>MetalEngine class<br/>GridRenderer class<br/>Camera input handling<br/>ImGui control panel<br/>N-body scene setup<br/>Triple-buffer management"]
-        CAM_H["Camera.h<br/>━━━━━━━━━━━━━━━━━<br/>Orbital camera<br/>View/proj matrices"]
-    end
-
-    subgraph Shared ["Shared (CPU ↔ GPU)"]
-        COMMON["ShaderCommon.h<br/>━━━━━━━━━━━━━━━━━<br/>SimObject struct<br/>CameraData struct<br/>SystemUniforms struct<br/>ObjectsUniform struct<br/>GridUniforms struct"]
-    end
-
-    subgraph GPU_K ["GPU Kernels (Metal)"]
-        GEO["geodesic.metal<br/>━━━━━━━━━━━━━━━━━<br/>raytrace — geodesic ray march<br/>simulate_disk_fluid — advection<br/>update_physics — N-body gravity<br/>bloom_extract — threshold filter<br/>luminance_reduce — auto-exposure<br/>post_process_suite — ACES + bloom<br/>grid_vertex / grid_fragment"]
-    end
-
-    MAIN --> COMMON
-    CAM_H --> MAIN
-    COMMON --> GEO
-
-    style CPU fill:#1a1a2e,stroke:#e94560,color:#eee
-    style Shared fill:#16213e,stroke:#f59e0b,color:#eee
-    style GPU_K fill:#0f3460,stroke:#00d2ff,color:#eee
+├── CMakeLists.txt
+└── README.md
 ```
 
 ---
@@ -294,95 +204,91 @@ graph TD
 | **Left Click + Drag** | Rotate camera orbit |
 | **Shift + Left Click + Drag** | Pan camera target |
 | **Scroll Wheel** | Zoom in / out |
-| **P** | Capture screenshot (PPM to `/tmp/`) |
+| **L** | Cycle learning lenses |
+| **P** | Capture screenshot (PPM) |
 | **Escape** | Quit |
-| **ImGui Sliders** | Real-time control of physics, disk, shadows, and optics |
+
+QA/scripting hooks (environment variables): `BH_QA=1` renders 100 frames, captures frame 90, and exits; `BH_ELEV`, `BH_AZIM`, `BH_SPIN`, `BH_CHARGE`, `BH_LENS`, `BH_BEAMING`, `BH_OVERLAYS=mcfg`, `BH_SHOT_DIR` override state for reproducible captures.
 
 ---
 
 ## Building
 
 ### Requirements
-- macOS with Apple Silicon (M1/M2/M3/M4)
-- `cmake` ≥ 3.10
+- macOS with Apple Silicon (M1–M4)
+- `cmake` ≥ 3.16
 - `glfw` and `glm` (via Homebrew or vcpkg)
 - Xcode (for precompiled `.metallib`; optional — falls back to runtime compilation)
 
 ### Build & Run
 ```bash
-# Install dependencies (if using Homebrew)
 brew install cmake glfw glm
 
-# Build
 mkdir build && cd build
 cmake ..
 make
 
-# Run
 ./MetalBlackhole
 ```
 
-### Shader Compilation
-
-Shaders are automatically precompiled to a `.metallib` binary at build time via `scripts/build_metallib.sh`. This requires a full Xcode installation.
-
-If the Metal compiler is unavailable, the build gracefully falls back to copying source files for runtime compilation with a console warning on startup.
+Shader edits are dependency-tracked: `make` refreshes the `.metallib` **and** the runtime-compile fallback copies.
 
 ---
 
 ## Presets
 
-The ImGui panel includes one-click presets for common spacetime geometries:
+| Preset | Spin (a) | Charge (Q) | Notes |
+|--------|----------|------------|-------|
+| **Schwarzschild** | 0.0 | 0.0 | Pure GR baseline |
+| **Kerr** | 0.7 | 0.0 | Frame dragging |
+| **Extreme Kerr** | 0.998 | 0.0 | Near-maximal spin + jets |
+| **Charged (RN)** | 0.0 | 0.5 | Reissner-Nordström (r_ph = 1.411 rs) |
+| **Kerr-Newman** | 0.6 | 0.3 | Full KN metric |
+| **Cinematic** | 0.85 | 0.0 | All visual effects + grid |
+| **EHT M87\* view** | 0.9 | 0.0 | 17° inclination, beam-blurred EHT lens |
+| **Luminet 1979** | 0.0 | 0.0 | Near edge-on classic view |
 
-| Preset | Spin (a) | Charge (Q) | Features |
-|--------|----------|------------|----------|
-| **Schwarzschild** | 0.0 | 0.0 | Pure GR — no spin, no charge |
-| **Kerr** | 0.7 | 0.0 | Spinning BH with frame dragging |
-| **Extreme Kerr** | 0.998 | 0.0 | Near-maximal spin + relativistic jets |
-| **Charged (RN)** | 0.0 | 0.5 | Reissner-Nordström geometry |
-| **Kerr-Newman** | 0.6 | 0.3 | Full KN metric + jets |
-| **Cinematic** | 0.85 | 0.0 | All visual effects enabled |
+Spin and charge are jointly clamped to `a² + Q² ≤ 1` (no silent naked-singularity renders).
 
 ---
 
 ## Validation
 
-The project includes a physics validation test suite that mathematically proves correctness against known analytical GR solutions:
-
 ```bash
 python3 tests/validate_physics.py
+# Expected: 83 passed, 0 failed
 ```
 
-### Test Coverage (47 tests)
+The suite mirrors the shader integrator in double precision (same ZAMO Kerr-Newman tetrad, same Hamiltonian RHS, same adaptive controller) and verifies it against closed-form GR:
 
-| Test | What It Validates |
-|------|-------------------|
-| Event Horizon | Kerr `r₊ = (1 + √(1−a²))/2` for a ∈ {0, 0.5, 0.9, 0.998, 0.9999} |
-| ISCO | Bardeen-Press-Teukolsky formula across spin range |
-| Photon Sphere | Circular null orbit stability at r = 1.5 rs (Schwarzschild) |
-| Shadow Radius | Critical impact parameter b = √27/2 ≈ 2.598 rs |
-| NT Temperature | Zero-torque boundary condition T → 0 at ISCO |
-| Gravitational Redshift | `g = √(1 − 3/(2r))` for circular orbits |
-| ZAMO Frequency | Exact Kerr `ω = a/(r³ + a²r + a²)` across 12 (a, r) pairs |
-| Polar Doppler | Zero beaming from top-down view (8 azimuthal samples) |
-| Equatorial Doppler | Left-right asymmetry with opposite signs |
-| Horizon Capture | Head-on and sub-critical rays absorbed, zero light bleed |
+| § | Test | Reference |
+|---|------|-----------|
+| 1 | Kerr **and** Kerr-Newman horizons, extremal RN | closed form |
+| 2 | BPT ISCO, prograde **and retrograde** branches (9M limit) | BPT 1972 |
+| 3 | Photon-sphere instability — a genuinely dynamical test | null geodesic condition |
+| 4 | Capture boundary bisection: `|L| = √27/2` to 1e-6 | critical impact parameter |
+| 5 | **Exact Darwin deflection** at b = 3…10 rs to ~1e-5 (through periapsis) | Darwin 1959 quadrature |
+| 6 | RN photon sphere + traced RN capture cross-section | closed form |
+| 7 | **End-to-end Doppler sign**: approaching limb g>1 from first principles | catches inversion bugs |
+| 8 | Cunningham ISCO limb extremes: g = √2, √2/3, 1/√2 exactly | Cunningham 1975 |
+| 9 | Carter constant (from **evolved** p_θ) + null-norm drift, on **strong-field** photon-shell grazes | genuine conservation |
+| 10 | KN circular-orbit Ω: closed form vs numerical geodesic condition | metric derivatives |
+| 11 | ZAMO frequency, static limit r_E(θ) | exact Kerr |
+| 12 | Disk visible from below the plane (ascending-crossing regression) | — |
+| 13 | **Traced shadow boundary = Bardeen critical curve** (a=0.9, both sides) + shadow-flattening/Doppler-side pairing | Bardeen 1973 |
+| 14 | Adaptive-integrator self-convergence | step-halving |
+| 15 | Page-Thorne flux shape (zero at ISCO, peak at 49/36 r_in) | Page-Thorne |
+| 16 | Accuracy at the **exact shipped GPU step constants** (honest gates) | Darwin quadrature |
+| 17 | Through-the-pole continuation (φ jumps by π across the axis) | BL chart continuation |
 
 ---
 
 ## Security Considerations
 
-### Precompiled Shader Library
-
-Shaders are precompiled to a signed `.metallib` binary at build time. This eliminates the GPU code injection risk of runtime `newLibraryWithSource:` compilation.
-
-### Input Validation
-
-All GPU uniform values are clamped to valid ranges at the CPU→GPU write site to prevent NaN propagation, division-by-zero, or excessive loop iteration from out-of-range parameters.
-
-### Compiler Hardening
-
-The build enables `-Wall -Wextra -Wformat-security -fstack-protector-strong`.
+- Precompiled, signed `.metallib` preferred at startup (no runtime source compilation in release use).
+- All GPU uniforms clamped at the CPU→GPU write site; spin/charge jointly clamped to the black-hole family.
+- Screenshots open with `O_CREAT|O_EXCL|O_NOFOLLOW` (no symlink clobbering, no overwrites).
+- Build enables `-Wall -Wextra -Wformat-security -fstack-protector-strong`; the codebase compiles warning-free.
 
 ---
 

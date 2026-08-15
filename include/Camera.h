@@ -9,7 +9,12 @@ struct Camera {
   glm::vec3 target = glm::vec3(0.0f);
   float radius;
   float azimuth = 0.5f;
-  float elevation = 0.4f;
+  // Elevation = polar angle from +y. 0 = straight-down (top of disk), π = up,
+  // π/2 = edge-on. 1.05 rad ≈ 60° from spin axis ≈ 30° above the disk plane —
+  // a diagnostic view that keeps the disk visible as a clear ellipse, the BH
+  // shadow as a dark circular cutout, and any gravitationally-lensed far-side
+  // image as a curved bright crescent above the shadow.
+  float elevation = 1.05f;
   bool dragging = false;
   bool panning = false;
   double lastX = 0.0;
