@@ -1236,6 +1236,93 @@ gamma = (sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
 check(f"Lyapunov exponent (fit over {n} points)", gamma, 1.0 / (math.sqrt(2.0) * m1), 1e-3)
 print()
 
+# --- TEST 25: crossing radii vs an INDEPENDENT 40-digit analytic reference ---
+print("TEST 25: Equatorial crossings vs closed-form/quadrature ground truth")
+print("-" * 40)
+# The strongest external check in the suite. These expected radii were produced
+# by an independent 40-digit quadrature arbiter (and cross-confirmed by the
+# Gralla-Lupsasca closed form and by DOP853 integration) — nothing here shares
+# code with the integrator being tested. Each fixture is specified by the
+# conserved quantities directly, so the test exercises the geodesic flow
+# without depending on the camera/tetrad setup.
+#
+# Convention bridge for the project's past-directed E = -1 congruence:
+#   lambda = L/E = -L_shader      eta = Q_C/E^2 = QC_shader      p_theta as given
+# Code units throughout (M = 1/2, metric a = spin/2, metric Q = charge/2).
+
+
+def crossings_from_conserved(a, Q, lam, eta, r_o, th_o, s_pth, s_pr=-1.0,
+                             eps=0.004, nmax=400000):
+    """Trace from conserved quantities; return interpolated equatorial crossings."""
+    Q2 = Q * Q
+    L = -lam
+    QC = eta
+    c, sn = math.cos(th_o), math.sin(th_o)
+    Th = QC + a * a * c * c - L * L * c * c / max(sn * sn, 1e-18)
+    D = r_o * r_o - r_o + a * a + Q2
+    P = -(r_o * r_o + a * a) - a * L           # E = -1
+    B = (L + a) ** 2 + QC
+    R = P * P - D * B
+    s = (r_o, th_o, 0.0,
+         s_pr * math.sqrt(max(R, 0.0)) / D,
+         s_pth * math.sqrt(max(Th, 0.0)))
+    r_h = 0.5 * (1 + math.sqrt(max(1 - 4 * a * a - 4 * Q2, 0.0)))
+    prev_cos, prev_r = c, r_o
+    out = []
+    for _ in range(nmax):
+        if s[0] < r_h * 1.02 or s[0] > r_o * 1.5:
+            break
+        h = adaptive_step(s, a, Q2, L, QC, r_h, eps, E=-1.0)
+        s = geo_rk4(s, h, a, Q2, L, QC, E=-1.0)
+        s = list(s)
+        if s[1] < 0:
+            s[1] = -s[1]; s[4] = -s[4]
+        elif s[1] > math.pi:
+            s[1] = 2 * math.pi - s[1]; s[4] = -s[4]
+        s = tuple(s)
+        cc = math.cos(s[1])
+        if prev_cos * cc < 0:
+            f = prev_cos / (prev_cos - cc)
+            out.append(prev_r + (s[0] - prev_r) * f)
+        prev_cos, prev_r = cc, s[0]
+    return out
+
+
+FIXTURES = [
+    ("Schwarzschild",        0.0,  0.0,   2.9544232590366239, 0.3338832064634125, 30.0, 80.0, -1,
+     [2.2756175947590619]),
+    ("Schwarzschild n=0,1",  0.0,  0.0,  -0.8040221879875261, 6.9785483212237516, 30.0, 17.0, -1,
+     [2.2131624240605888, 3.7708373857550871]),
+    ("Kerr a/M=0.5",         0.25, 0.0,   3.2006251972896762, 0.5666137408739813, 30.0, 80.0,  1,
+     [3.8649230848775872]),
+    ("Kerr a/M=0.94",        0.47, 0.0,   2.4620193825305199, 0.7442996100098400, 30.0, 80.0,  1,
+     [4.3277233120696063, 6.4807043478336234]),
+    ("Kerr a/M=0.998",       0.499, 0.0, -3.4468271355427280, 0.6118743988204673, 30.0, 80.0, -1,
+     [2.3969526253286886, 3.8627273115271992]),
+    ("Kerr-Newman .94/.3",   0.47, 0.15,  2.4620193825305199, 0.7442996100098400, 30.0, 80.0,  1,
+     [4.3278830272606684, 6.9111029658938518]),
+    ("Reissner-Nordstrom",   0.0,  0.15, -0.8040221879875261, 6.9785483212237516, 30.0, 17.0, -1,
+     [2.2177504580129715, 4.7027178906975891]),
+    ("captured ray",         0.25, 0.0,  -2.7082213207835721, 0.4761526720528437, 30.0, 80.0, -1,
+     [1.6914845554609167]),
+    ("close camera r=5",     0.47, 0.0,   2.5980762113533160, 2.4447750000000008,  5.0, 60.0, -1,
+     [2.6728953244761742]),
+]
+for (name, a, Q, lam, eta, r_o, th_deg, s_pth, expected) in FIXTURES:
+    got = crossings_from_conserved(a, Q, lam, eta, r_o, math.radians(th_deg), float(s_pth))
+    worst = 0.0
+    matched = len(got) >= len(expected)
+    for e in expected:
+        if not got:
+            matched = False
+            break
+        best = min(abs(g - e) / e for g in got)
+        worst = max(worst, best)
+        if best > 5e-5:
+            matched = False
+    check_true(f"{name}: {len(expected)} crossing(s), worst rel err {worst:.2e}", matched)
+print()
+
 # ============================================================
 #  SUMMARY
 # ============================================================
