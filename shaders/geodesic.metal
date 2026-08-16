@@ -438,6 +438,131 @@ static inline bool torus_sample(float r_rs, float cos_th, float sin_th,
     return true;
 }
 
+// =====================================================================
+// MAJUMDAR-PAPAPETROU: N extremally-charged black holes in exact static
+// equilibrium (an EXACT solution of Einstein-Maxwell, not a superposition
+// approximation — gravitational attraction is balanced by electrostatic
+// repulsion, so the configuration is genuinely static).
+//
+//   ds^2 = -U^-2 dt^2 + U^2 (dx^2 + dy^2 + dz^2),   U = 1 + sum_i m_i/|x - x_i|
+//
+// Null geodesics reduce to a strikingly simple exact form. With t cyclic,
+// E = U^-2 tdot is conserved; the null condition then forces the COORDINATE
+// SPEED to be constant, |dx/dlambda| = E, and the spatial equation is
+//
+//   d^2 x^i / dlambda^2 = (2/U) [ E^2 dU/dx^i - (grad U . xdot) xdot^i ]
+//
+// (verified symbolically against the full Christoffel computation, and
+// numerically: a single hole reproduces the extremal Reissner-Nordstrom
+// critical impact parameter b = 4m to 5e-10 — an independent cross-check of
+// the Kerr-Newman path, which reaches the same number via Carter separation.)
+//
+// The camera setup is trivial in this chart: a static observer's tetrad is
+// e_0 = U d_t, e_i = U^-1 d_i, so choosing the local energy E_loc = U gives
+// E = 1 and xdot = n, the unit pixel direction itself. No tetrad algebra.
+//
+// There is no Carter constant here — that is the point. Binary shadows are
+// chaotic scatterers: the capture basin boundary is fractal, and each hole
+// carries self-similar "eyebrow" structures on the side facing its companion.
+// =====================================================================
+
+struct MPField { float U; float3 gradU; float r_min; int nearest; };
+
+static inline MPField mp_field(float3 p, constant SystemUniforms& sys) {
+    MPField f;
+    f.U = 1.0f;
+    f.gradU = float3(0.0f);
+    f.r_min = 1e30f;
+    f.nearest = 0;
+    float hsep = 0.5f * sys.mp_sep;   // ('half' is a reserved MSL type name)
+    float m[2] = { sys.mp_m1, sys.mp_m2 };
+    float3 c[2] = { float3(-hsep, 0.0f, 0.0f), float3(hsep, 0.0f, 0.0f) };
+    for (int i = 0; i < 2; i++) {
+        if (m[i] <= 0.0f) continue;
+        float3 d = p - c[i];
+        float r = max(length(d), 1e-6f);
+        f.U += m[i] / r;
+        f.gradU -= d * (m[i] / (r * r * r));
+        if (r < f.r_min) { f.r_min = r; f.nearest = i; }
+    }
+    return f;
+}
+
+struct MPState { float3 p; float3 v; };
+
+static inline MPState mp_rhs(MPState s, float E, constant SystemUniforms& sys) {
+    MPField f = mp_field(s.p, sys);
+    float gv = dot(f.gradU, s.v);
+    MPState d;
+    d.p = s.v;
+    d.v = (2.0f / f.U) * (E * E * f.gradU - gv * s.v);
+    return d;
+}
+
+struct MPResult {
+    int    fate;        // 1 captured, 2 escaped, 0 budget exhausted (trapped)
+    int    hole;        // which hole absorbed the ray
+    int    crossings;   // equatorial-plane crossings (proxy for winding order)
+    float3 exit_dir;
+    float3 emis;        // accumulated decorative glow
+};
+
+static MPResult trace_mp(float3 ro, float3 rd, constant SystemUniforms& sys) {
+    MPResult res;
+    res.fate = 0; res.hole = 0; res.crossings = 0;
+    res.exit_dir = rd; res.emis = float3(0.0f);
+
+    const float E = 1.0f;                       // xdot = n gives E = 1 exactly
+    MPState s; s.p = ro; s.v = rd;
+
+    float r_esc = max(length(ro) * 1.05f, 60.0f);
+    // Extremal horizons sit at r_i = 0 in this chart (an infinite throat);
+    // terminate at a small fraction of the hole mass.
+    float r_stop = 0.02f * max(min(sys.mp_m1, sys.mp_m2), 1e-3f);
+    float prev_y = s.p.y;
+
+    for (int i = 0; i < 1500; i++) {
+        MPField f = mp_field(s.p, sys);
+        if (f.r_min < r_stop) { res.fate = 1; res.hole = f.nearest; break; }
+        float R = length(s.p);
+        if (R > r_esc && dot(s.p, s.v) > 0.0f) { res.fate = 2; break; }
+
+        // Step control: bound both the bending per step and the approach to
+        // the nearest hole, where |grad U| ~ m/r^2 diverges.
+        MPState d = mp_rhs(s, E, sys);
+        float amag = length(d.v) + 1e-20f;
+        float h = min(0.03f * E / amag, 0.10f * f.r_min / E);
+        h = clamp(h, 1e-5f, 0.5f);
+
+        MPState k1 = mp_rhs(s, E, sys);
+        MPState s2; s2.p = s.p + 0.5f * h * k1.p; s2.v = s.v + 0.5f * h * k1.v;
+        MPState k2 = mp_rhs(s2, E, sys);
+        MPState s3; s3.p = s.p + 0.5f * h * k2.p; s3.v = s.v + 0.5f * h * k2.v;
+        MPState k3 = mp_rhs(s3, E, sys);
+        MPState s4; s4.p = s.p + h * k3.p; s4.v = s.v + h * k3.v;
+        MPState k4 = mp_rhs(s4, E, sys);
+        s.p += h * (k1.p + 2.0f * k2.p + 2.0f * k3.p + k4.p) / 6.0f;
+        s.v += h * (k1.v + 2.0f * k2.v + 2.0f * k3.v + k4.v) / 6.0f;
+
+        // |xdot| = E is an exact algebraic invariant of the null condition;
+        // re-project so round-off cannot drift the ray off the light cone
+        // over the long chaotic orbits between the holes. (The Python mirror
+        // leaves it free and asserts the drift instead, so the projection
+        // cannot hide integrator error.)
+        s.v *= E / max(length(s.v), 1e-12f);
+
+        if (prev_y * s.p.y < 0.0f) res.crossings++;
+        prev_y = s.p.y;
+
+        if (sys.mp_glow > 0.0f) {
+            float glow = sys.mp_glow * 0.0015f / max(f.r_min * f.r_min, 1e-4f);
+            res.emis += float3(0.35f, 0.55f, 1.0f) * min(glow * h, 0.05f);
+        }
+    }
+    res.exit_dir = normalize(s.v);
+    return res;
+}
+
 kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
                      constant CameraData& cam [[buffer(0)]],
                      const device SimObject* objs [[buffer(1)]],
@@ -451,9 +576,33 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
     // converges to supersampled ground truth on a static camera.
     float px = float(pix.x) + 0.5f + sys.jitter_x;
     float py = float(pix.y) + 0.5f + sys.jitter_y;
-    float ur = (2.0f * px / float(w) - 1.0f) * cam.aspect * cam.tanHalfFov;
-    float vr = (1.0f - 2.0f * py / float(h)) * cam.tanHalfFov;
-    float3 rd = normalize(ur * cam.camRight.xyz + vr * cam.camUp.xyz + cam.camForward.xyz);
+    float3 F = cam.camForward.xyz, Rt = cam.camRight.xyz, Up = cam.camUp.xyz;
+    float3 rd;
+    if (sys.projection == PROJ_EQUIRECT) {
+        // 360 lat-long, 2:1. Longitude sweeps the full circle with the camera
+        // forward direction at the image centre; latitude runs +90 (top) to
+        // -90 (bottom). This is the convention spherical-video players expect.
+        float lon = (2.0f * px / float(w) - 1.0f) * 3.14159265f;
+        float lat = (0.5f - py / float(h)) * 3.14159265f;
+        float cl = cos(lat);
+        rd = normalize(cl * cos(lon) * F + cl * sin(lon) * Rt + sin(lat) * Up);
+    } else if (sys.projection == PROJ_MOLLWEIDE) {
+        // Equal-area all-sky. Inverse Mollweide: solve for the auxiliary angle
+        // theta, then latitude; pixels outside the ellipse are not on the sky.
+        float X = 2.0f * px / float(w) - 1.0f;
+        float Y = 1.0f - 2.0f * py / float(h);
+        if (X * X + Y * Y > 1.0f) { out.write(float4(0.0f, 0.0f, 0.0f, 1.0f), pix); return; }
+        float th = asin(clamp(Y, -1.0f, 1.0f));
+        float lat = asin(clamp((2.0f * th + sin(2.0f * th)) / 3.14159265f, -1.0f, 1.0f));
+        float lon = 3.14159265f * X / max(cos(th), 1e-6f);
+        if (abs(lon) > 3.14159265f) { out.write(float4(0.0f, 0.0f, 0.0f, 1.0f), pix); return; }
+        float cl = cos(lat);
+        rd = normalize(cl * cos(lon) * F + cl * sin(lon) * Rt + sin(lat) * Up);
+    } else {
+        float ur = (2.0f * px / float(w) - 1.0f) * cam.aspect * cam.tanHalfFov;
+        float vr = (1.0f - 2.0f * py / float(h)) * cam.tanHalfFov;
+        rd = normalize(ur * Rt + vr * Up + F);
+    }
     float3 ro = cam.camPos.xyz;
 
     if (u_obj.bh_index < 0 || u_obj.bh_index >= u_obj.count) return;
@@ -461,6 +610,34 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
     float rs = bh->posRadius.w;
     float3 bhPos = bh->posRadius.xyz;
     float3 ro_bh = (ro - bhPos) / rs;
+
+    // ----- Majumdar-Papapetrou binary: a different spacetime entirely. -----
+    if (sys.bh_mode == BH_MP_BINARY) {
+        MPResult mp = trace_mp(ro_bh, rd, sys);
+        float3 col;
+        if (sys.lens_mode == LENS_RING_ORDER) {
+            // Capture-basin map: this is where the chaotic scattering shows —
+            // the boundary between the two basins is fractal, and each hole's
+            // basin grows self-similar "eyebrows" facing its companion.
+            if      (mp.fate == 1) col = (mp.hole == 0) ? float3(0.90f, 0.35f, 0.10f)
+                                                        : float3(0.10f, 0.55f, 0.90f);
+            else if (mp.fate == 0) col = float3(0.95f, 0.90f, 0.20f);   // trapped
+            else {
+                float w8 = clamp(float(mp.crossings) * 0.2f, 0.0f, 1.0f);
+                col = mix(float3(0.05f, 0.06f, 0.10f), float3(0.55f, 0.20f, 0.65f), w8);
+            }
+        } else if (mp.fate == 1) {
+            col = float3(0.0f);
+        } else {
+            col = (sys.lens_mode == LENS_CHECKER)
+                ? checker_sky(mp.exit_dir, cam.camForward.xyz)
+                : (float3)sampleBackground_half(mp.exit_dir, sys.time,
+                                                sys.star_scint, sys.nebula_int);
+            col += mp.emis;
+        }
+        out.write(float4(col, 1.0f), pix);
+        return;
+    }
 
     KerrConst kerr;
     kerr.a  = 0.5f * sys.spin;

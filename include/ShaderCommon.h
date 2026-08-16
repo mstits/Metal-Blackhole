@@ -46,6 +46,15 @@ struct CameraData {
 #define BEAM_NO_BOOST    1   // temperature shift only (color, no intensity change)
 #define BEAM_NONE        2   // no shift, no boost (Luminet-style bolometric render)
 
+// Spacetime backgrounds (SystemUniforms::bh_mode).
+#define BH_KERR_NEWMAN   0   // single rotating charged hole (Carter-separated)
+#define BH_MP_BINARY     1   // N extremal holes in static equilibrium (Majumdar-Papapetrou)
+
+// Camera projections (SystemUniforms::projection).
+#define PROJ_PERSPECTIVE 0
+#define PROJ_EQUIRECT    1   // 360 lat-long (2:1), for VR / spherical video
+#define PROJ_MOLLWEIDE   2   // all-sky equal-area, as NASA publishes alongside 360s
+
 // Accretion-flow models (SystemUniforms::disk_model).
 #define DISK_THIN        0   // optically-thick Novikov-Thorne surface at theta = pi/2
 #define DISK_VOLUMETRIC  1   // optically-thin plasma torus, covariant radiative transfer
@@ -90,7 +99,14 @@ struct SystemUniforms {
     int   beaming_mode;     // BEAM_* above
     int   star_bodies;      // 1 = render + lens the N-body companion stars
     int   disk_model;       // DISK_* above
-    int   _padi[3];
+    int   bh_mode;          // BH_* above
+    int   projection;       // PROJ_* above
+    int   _padi1;
+    // Majumdar-Papapetrou binary (code units, rs = 2M_total).
+    float mp_m1;            // mass of hole 1
+    float mp_m2;            // mass of hole 2
+    float mp_sep;           // coordinate separation along x
+    float mp_glow;          // decorative near-horizon glow
 };
 
 struct ObjectsUniform {

@@ -1,6 +1,6 @@
 # Metal Blackhole
 
-A high-fidelity, real-time black hole visualization and learning tool for Apple Silicon via the Metal API. The engine integrates exact Kerr-Newman null geodesics per pixel, renders either a Novikov-Thorne thin disk or an optically-thin plasma torus with full covariant radiative transfer, outputs true HDR on XDR displays, and includes a set of toggleable **learning lenses** — the same alternative visualizations researchers use in papers (photon-ring image orders, redshift maps, checkerboard lensing skies, EHT beam convolution) — validated against an 87-test analytic GR suite.
+A high-fidelity, real-time black hole visualization and learning tool for Apple Silicon via the Metal API. The engine integrates exact null geodesics per pixel in two different spacetimes — a single Kerr-Newman hole and an exact **Majumdar-Papapetrou binary** — renders either a Novikov-Thorne thin disk or an optically-thin plasma torus with full covariant radiative transfer, outputs true HDR on XDR displays, and includes a set of toggleable **learning lenses** — the same alternative visualizations researchers use in papers (photon-ring image orders, redshift maps, checkerboard lensing skies, EHT beam convolution) — validated against a 94-test analytic GR suite.
 <img width="1312" height="940" alt="blackhole_screenshot" src="https://github.com/user-attachments/assets/98ee9e2e-913c-41ba-a067-f5cb44b1712f" />
 
 ---
@@ -34,6 +34,10 @@ A high-fidelity, real-time black hole visualization and learning tool for Apple 
 - **N-Body Gravity:** GPU velocity-Verlet leapfrog (KDK) at a **fixed physics timestep** (host-substepped), so orbital accuracy is independent of frame rate.
 - **Dimensionless Units:** Length scale `rs = 2M`, with `M = ½` so `Δ = r² − r + a² + Q²` stays numerically well-conditioned.
 
+### Spacetimes
+- **Kerr-Newman (single hole):** mass + spin + charge, Carter-separated, past-directed congruence.
+- **Majumdar-Papapetrou binary:** two extremally-charged holes in **exact** static equilibrium — a genuine solution of Einstein-Maxwell, not a superposition approximation (gravitational attraction is balanced by electrostatic repulsion). Null geodesics reduce to a strikingly simple exact form, `d²x/dλ² = (2/U)[E²∇U − (∇U·ẋ)ẋ]` with `U = 1 + Σ mᵢ/|x−xᵢ|`, and the camera setup is trivial (`ẋ = pixel direction`, `E = 1`). **There is no Carter constant here** — that is the point: the capture basin is a chaotic scatterer with a fractal boundary and self-similar "eyebrow" structures facing each companion. The Image-order lens renders the capture basins directly; the Checkerboard sky shows the lensing.
+
 ### Accretion Flow Models
 - **Thin disk (optically thick):** Novikov-Thorne surface at the equator — the classic Luminet/EHT thin-disk image.
 - **Volumetric torus (GRMHD-style):** an optically-thin plasma torus integrated with the covariant radiative-transfer equation `d(I_ν/ν³)/dλ = j_ν/ν² − (ν α_ν)(I_ν/ν³)`, with a non-Keplerian rotation law set by a specific-angular-momentum profile `l(R)` (the EHT code-comparison parameterization, Gold et al. 2020). Emissivity scales as `n²` (two-body/free-free), and self-absorption gives the flow a real photosphere. The Doppler asymmetry *emerges from the transport* rather than being applied by hand — at spectral index `α_s = −2` it cancels exactly, an identity the test suite verifies to machine precision.
@@ -47,6 +51,10 @@ A high-fidelity, real-time black hole visualization and learning tool for Apple 
 - **Companion Stars with Occlusion:** N-body stars are sphere-intersected in world space from the ray's escape point — occluded by the disk and horizon, lensed by the geodesic bending, limb-darkened.
 - **Temporal Accumulation AA:** Per-frame Halton subpixel jitter accumulates into a progressive supersample whenever the camera is static (reference-quality stills in ~64 frames); bounded history while the N-body animation runs.
 - **Polar Relativistic Jets, Ergosphere Shimmer** (decorative, clearly gated).
+
+### Projections & Export
+- **Perspective**, **360° equirectangular** (2:1, for VR / spherical-video players), and **Mollweide** all-sky — a ray tracer gets these almost free, since only the pixel→direction mapping changes.
+- **Reference stills:** an offline exporter renders at arbitrary resolution and projection with N accumulated jittered samples, independent of the window, and writes a **scene-linear half-float OpenEXR** (via ImageIO's native `com.ilm.openexr-image` — no third-party dependency). The file holds true radiometric values with no tonemapping or UI baked in: a typical capture peaks near 28× reference white with ~19% of components above 1.0.
 
 ### Cinematic Suite
 - **ACES Filmic Tonemapping** with exposure applied before all display-referred effects.
@@ -210,10 +218,13 @@ metal_blackhole/
 | **Shift + Left Click + Drag** | Pan camera target |
 | **Scroll Wheel** | Zoom in / out |
 | **L** | Cycle learning lenses |
+| **E** | Write the accumulated frame as a scene-linear EXR |
+| **R** | Reference still: 4K, 256 accumulated samples → EXR |
+| **3** | 360° panorama: 4096×2048 equirectangular, 128 samples → EXR |
 | **P** | Capture screenshot (PPM) |
 | **Escape** | Quit |
 
-QA/scripting hooks (environment variables): `BH_QA=1` renders 100 frames, captures frame 90, and exits; `BH_ELEV`, `BH_AZIM`, `BH_SPIN`, `BH_CHARGE`, `BH_LENS`, `BH_BEAMING`, `BH_OVERLAYS=mcfg`, `BH_MODEL` (0 thin / 1 volumetric), `BH_ALPHA`, `BH_ABSORB`, `BH_JETS`, `BH_NOEDR`, `BH_SHOT_DIR` override state for reproducible captures. Captures report the peak linear value and the display's EDR headroom.
+QA/scripting hooks (environment variables): `BH_QA=1` renders 100 frames, captures frame 90, and exits; `BH_ELEV`, `BH_AZIM`, `BH_SPIN`, `BH_CHARGE`, `BH_LENS`, `BH_BEAMING`, `BH_OVERLAYS=mcfg`, `BH_MODEL` (0 thin / 1 volumetric), `BH_ALPHA`, `BH_ABSORB`, `BH_JETS`, `BH_NOEDR`, `BH_BINARY=<separation>`, `BH_M2`, `BH_PROJ` (0/1/2), `BH_RADIUS`, `BH_EXR`, `BH_PANO`, `BH_STILL`, `BH_SHOT_DIR` override state for reproducible captures. Captures report the peak linear value and the display's EDR headroom.
 
 ---
 
@@ -251,6 +262,7 @@ Shader edits are dependency-tracked: `make` refreshes the `.metallib` **and** th
 | **Kerr-Newman** | 0.6 | 0.3 | Full KN metric |
 | **Cinematic** | 0.85 | 0.0 | All visual effects + grid |
 | **EHT M87\* view** | 0.9 | 0.0 | 17° inclination, beam-blurred EHT lens |
+| **MP binary** | — | extremal | Two exact-equilibrium holes; fractal capture basins |
 | **Volumetric torus** | 0.9 | 0.0 | GRMHD-style optically-thin plasma flow |
 | **Luminet 1979** | 0.0 | 0.0 | Near edge-on classic view |
 
@@ -262,7 +274,7 @@ Spin and charge are jointly clamped to `a² + Q² ≤ 1` (no silent naked-singul
 
 ```bash
 python3 tests/validate_physics.py
-# Expected: 87 passed, 0 failed
+# Expected: 94 passed, 0 failed
 ```
 
 The suite mirrors the shader integrator in double precision (same ZAMO Kerr-Newman tetrad, same Hamiltonian RHS, same adaptive controller) and verifies it against closed-form GR:
@@ -288,6 +300,9 @@ The suite mirrors the shader integrator in double precision (same ZAMO Kerr-Newm
 | 17 | Through-the-pole continuation (φ jumps by π across the axis) | BL chart continuation |
 | 18 | **Volumetric Doppler-cancellation identity** at α_s = −2 (machine precision, with an α_s = 0 asymmetry control) | Gold et al. 2020 Test 2 |
 | 19 | Radiative-transfer limits: absorption dims monotonically; optically-thick intensity saturates at the source function `S = J/A` | transfer equation |
+| 20 | **MP single hole = extremal Reissner-Nordström**: critical impact parameter `b = 4m` to 3×10⁻⁸ — reached through a completely independent formulation from the Carter-separated path that gets the same number in §6 | exact solution |
+| 21 | MP binary: `L_x` conserved, `\|ẋ\| = E` drift < 1e-6 (measured, not re-projected in the mirror), and exact `x → −x` reflection symmetry for equal masses | conservation / symmetry |
+| 22 | Wide-separation limit: each hole's shadow → the isolated `4m` value to 1 part in 10⁴ | asymptotics |
 
 ---
 

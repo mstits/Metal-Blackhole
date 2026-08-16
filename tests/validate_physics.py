@@ -992,6 +992,169 @@ check("optically-thick source function scales as 1/absorb", ratio, 2.0, 0.05)
 print()
 
 # ============================================================
+#  Majumdar-Papapetrou binary: mirror of the shader's MP integrator
+# ============================================================
+# ds^2 = -U^-2 dt^2 + U^2 dx.dx,  U = 1 + sum m_i/|x - x_i|  (exact solution of
+# Einstein-Maxwell for extremally-charged holes in static equilibrium).
+# Null geodesics: E = U^-2 tdot conserved, |dx/dlambda| = E, and
+#   d2x^i/dlambda^2 = (2/U)[E^2 dU/dx^i - (grad U . xdot) xdot^i]
+# (derived from the Lagrangian and verified symbolically against the full
+# Christoffel computation). NOTE: unlike the shader, this mirror does NOT
+# re-project |xdot| to E — it measures the drift instead, so the projection in
+# the shader cannot hide integrator error.
+
+
+def mp_field(p, holes):
+    U = 1.0
+    g = [0.0, 0.0, 0.0]
+    r_min = 1e30
+    for (m, c) in holes:
+        d = [p[i] - c[i] for i in range(3)]
+        r = max(math.sqrt(sum(x * x for x in d)), 1e-12)
+        U += m / r
+        k = -m / (r ** 3)
+        for i in range(3):
+            g[i] += k * d[i]
+        r_min = min(r_min, r)
+    return U, g, r_min
+
+
+def mp_rhs(p, v, E, holes):
+    U, gU, _ = mp_field(p, holes)
+    gv = sum(gU[i] * v[i] for i in range(3))
+    return v, [(2.0 / U) * (E * E * gU[i] - gv * v[i]) for i in range(3)]
+
+
+def mp_trace(p, v, holes, E=1.0, eps=0.01, max_steps=200000, r_esc=None):
+    """Returns (fate, steps, p, v, max |xdot|-E drift)."""
+    p = list(p); v = list(v)
+    if r_esc is None:
+        r_esc = math.sqrt(sum(c * c for c in p)) * 1.05
+    r_stop = 0.02 * min(m for (m, _) in holes if m > 0)
+    drift = 0.0
+    for i in range(max_steps):
+        U, gU, r_min = mp_field(p, holes)
+        if r_min < r_stop:
+            return ('captured', i, p, v, drift)
+        R = math.sqrt(sum(c * c for c in p))
+        if R > r_esc and sum(p[k] * v[k] for k in range(3)) > 0:
+            return ('escaped', i, p, v, drift)
+        _, a = mp_rhs(p, v, E, holes)
+        amag = math.sqrt(sum(c * c for c in a)) + 1e-30
+        hstep = min(eps * E / amag, 0.10 * r_min / E)
+        hstep = max(min(hstep, 0.5), 1e-9)
+        k1p, k1v = mp_rhs(p, v, E, holes)
+        k2p, k2v = mp_rhs([p[j] + 0.5 * hstep * k1p[j] for j in range(3)],
+                          [v[j] + 0.5 * hstep * k1v[j] for j in range(3)], E, holes)
+        k3p, k3v = mp_rhs([p[j] + 0.5 * hstep * k2p[j] for j in range(3)],
+                          [v[j] + 0.5 * hstep * k2v[j] for j in range(3)], E, holes)
+        k4p, k4v = mp_rhs([p[j] + hstep * k3p[j] for j in range(3)],
+                          [v[j] + hstep * k3v[j] for j in range(3)], E, holes)
+        p = [p[j] + hstep * (k1p[j] + 2 * k2p[j] + 2 * k3p[j] + k4p[j]) / 6.0 for j in range(3)]
+        v = [v[j] + hstep * (k1v[j] + 2 * k2v[j] + 2 * k3v[j] + k4v[j]) / 6.0 for j in range(3)]
+        drift = max(drift, abs(math.sqrt(sum(c * c for c in v)) - E) / E)
+    return ('exhausted', max_steps, p, v, drift)
+
+
+# --- TEST 20: single MP hole reproduces extremal Reissner-Nordstrom ---
+print("TEST 20: Majumdar-Papapetrou single hole = extremal Reissner-Nordstrom")
+print("-" * 40)
+# A single MP hole U = 1 + m/r IS extremal RN in isotropic coordinates
+# (areal R = r + m, horizon at r = 0). Its critical impact parameter must be
+# the extremal-RN value b = 4M that TEST 6 derives independently through the
+# Carter-separated Kerr-Newman path — two completely different formulations
+# of the same spacetime, so agreement is a strong cross-validation.
+m1 = 1.0
+R0 = 2000.0
+one_hole = [(m1, (0.0, 0.0, 0.0))]
+
+
+def mp_fate(b, holes=one_hole, start=R0):
+    return mp_trace((-start, b, 0.0), (1.0, 0.0, 0.0), holes)[0]
+
+
+lo, hi = 2.0, 8.0
+for _ in range(44):
+    mid = 0.5 * (lo + hi)
+    if mp_fate(mid) == 'captured':
+        lo = mid
+    else:
+        hi = mid
+b_off = 0.5 * (lo + hi)
+# The launch offset is a coordinate distance at finite radius; the asymptotic
+# impact parameter is b = L/E = U(R0)^2 * offset.
+U0 = 1.0 + m1 / R0
+check("MP critical impact parameter = 4m (extremal RN)", U0 * U0 * b_off, 4.0 * m1, 1e-6)
+res = mp_trace((-R0, 6.0, 0.0), (1.0, 0.0, 0.0), one_hole)
+check_true(f"|xdot| = E preserved without re-projection (drift {res[4]:.2e})",
+           res[4] < 1e-9)
+print()
+
+# --- TEST 21: binary conservation and symmetry ---
+print("TEST 21: MP binary — conserved quantities and reflection symmetry")
+print("-" * 40)
+d_sep = 6.0
+binary = [(0.5, (-0.5 * d_sep, 0.0, 0.0)), (0.5, (0.5 * d_sep, 0.0, 0.0))]
+
+# Axial angular momentum about the symmetry axis (the line joining the holes,
+# here the x-axis): L_x = U^2 (y zdot - z ydot) is conserved; there is NO
+# Carter constant for this spacetime.
+p0 = (-40.0, 3.0, 2.0)
+v0 = (1.0, 0.0, 0.0)
+U_s, _, _ = mp_field(p0, binary)
+Lx0 = U_s ** 2 * (p0[1] * v0[2] - p0[2] * v0[1])
+st = mp_trace(p0, v0, binary)
+pf, vf = st[2], st[3]
+U_f, _, _ = mp_field(pf, binary)
+Lxf = U_f ** 2 * (pf[1] * vf[2] - pf[2] * vf[1])
+check_true(f"L_x conserved along a binary geodesic ({Lx0:.6f} -> {Lxf:.6f})",
+           abs(Lxf - Lx0) <= 1e-6 * max(abs(Lx0), 1.0))
+# The binary field is stiffer than a single hole (7.6e-10 there): closer
+# approaches and two competing 1/r^2 gradients. 1e-6 is still far tighter than
+# the ~1e-4 invariant drift production GRRT codes hold.
+check_true(f"|xdot| = E drift in the binary field ({st[4]:.2e})", st[4] < 1e-6)
+
+# Equal masses => the metric is invariant under x -> -x. A ray and its mirror
+# must have mirror-image trajectories and identical fates. This is a strong
+# zero-reference-data check on the whole binary integrator.
+mirror_ok = True
+for (b, zz) in ((1.2, 0.0), (2.5, 0.8), (4.0, -1.5)):
+    A = mp_trace((-40.0, b, zz), (1.0, 0.0, 0.0), binary)
+    B = mp_trace((40.0, b, zz), (-1.0, 0.0, 0.0), binary)
+    if A[0] != B[0]:
+        mirror_ok = False
+    elif A[0] == 'escaped':
+        # mirrored exit direction: vx flips, vy/vz match
+        if (abs(A[3][0] + B[3][0]) > 1e-7 or abs(A[3][1] - B[3][1]) > 1e-7
+                or abs(A[3][2] - B[3][2]) > 1e-7):
+            mirror_ok = False
+check_true("equal-mass binary is exactly symmetric under x -> -x", mirror_ok)
+print()
+
+# --- TEST 22: wide-separation limit recovers two isolated holes ---
+print("TEST 22: MP binary -> two isolated extremal RN holes as separation grows")
+print("-" * 40)
+# Aim at hole 1 with the companion pushed far away; the measured critical
+# impact parameter about that hole must approach the isolated 4m value.
+for sep in (40.0, 400.0):
+    far = [(0.5, (0.0, 0.0, 0.0)), (0.5, (sep, 0.0, 0.0))]
+    lo, hi = 0.5, 4.0
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        f = mp_trace((-800.0, mid, 0.0), (1.0, 0.0, 0.0), far)[0]
+        if f == 'captured':
+            lo = mid
+        else:
+            hi = mid
+    # Same asymptotic conversion as TEST 20: b = L/E = U(start)^2 * offset.
+    U_st = 1.0 + 0.5 / 800.0 + 0.5 / (800.0 + sep)
+    b_meas = U_st * U_st * 0.5 * (lo + hi)
+    rel = abs(b_meas - 2.0) / 2.0
+    check_true(f"separation {sep:5.0f}m: b = {b_meas:.4f} -> 4m = 2.0 (rel {rel:.4f})",
+               rel < (0.02 if sep < 100 else 0.005))
+print()
+
+# ============================================================
 #  SUMMARY
 # ============================================================
 print("=" * 70)
