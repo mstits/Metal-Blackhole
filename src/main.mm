@@ -69,6 +69,18 @@ struct SimSettings {
   float vignetteIntensity  = 0.6f;
   float ehtBeamFwhm        = 2.6f;      // telescope beam FWHM in rs units
 
+  int  diskModel       = DISK_THIN;
+  float torusR0        = 7.0f;     // ring radius (M units)
+  float torusH         = 6.0f;
+  float torusL0        = 1.0f;
+  float torusAlpha     = 0.0f;     // j_nu ~ nu^0; -2 gives exact Doppler cancellation
+  float torusAbsorb    = 1.0f;     // moderate self-absorption: the core
+                                   // becomes optically thick (tau ~ 2), which
+                                   // is what gives a real flow its photosphere
+                                   // and keeps the ring from saturating
+  float torusTemp      = 6500.0f;
+  float torusDensity   = 1.0f;
+  bool enEDR           = true;
   int  lensMode        = LENS_STANDARD;
   int  beamingMode     = BEAM_FULL;
   bool enStarBodies    = true;
@@ -296,7 +308,7 @@ public:
     MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
     pd.vertexFunction = [library newFunctionWithName:@"grid_vertex"];
     pd.fragmentFunction = [library newFunctionWithName:@"grid_fragment"];
-    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
     pd.colorAttachments[0].blendingEnabled = YES;
     pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
     pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
@@ -344,6 +356,24 @@ public:
     indexBuffer = [device newBufferWithBytes:inds.data() length:inds.size() * sizeof(uint32_t) options:MTLResourceStorageModeShared];
   }
 };
+
+// The drawable is extended-linear, so display-authored UI/overlay colors must
+// be linearized before they are blended into it.
+static inline float srgb_to_lin(float c) {
+  return (c <= 0.04045f) ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+static inline ImU32 linCol(int r, int g, int b, int a = 255) {
+  return IM_COL32((int)(srgb_to_lin(r / 255.0f) * 255.0f + 0.5f),
+                  (int)(srgb_to_lin(g / 255.0f) * 255.0f + 0.5f),
+                  (int)(srgb_to_lin(b / 255.0f) * 255.0f + 0.5f), a);
+}
+static void linearizeImGuiStyle() {
+  ImGuiStyle &st = ImGui::GetStyle();
+  for (int i = 0; i < ImGuiCol_COUNT; i++) {
+    ImVec4 &c = st.Colors[i];
+    c.x = srgb_to_lin(c.x); c.y = srgb_to_lin(c.y); c.z = srgb_to_lin(c.z);
+  }
+}
 
 // Halton low-discrepancy sequence for subpixel jitter.
 static float halton(int index, int base) {
@@ -400,6 +430,7 @@ public:
   // Temporal accumulation state: N frames accumulated since the scene state
   // last changed. Static camera + jittered rays -> progressive supersampling.
   int accumN = 0;
+  float edrHeadroom = 1.0f;     // display-reported; 1.0 on SDR panels
   bool accumHistoryValid = false;   // false after createResources(): the fresh
                                     // private textures hold undefined memory
   uint64_t lastStateHash = 0;
@@ -420,14 +451,17 @@ public:
     NSView *view = [nswin contentView];
     metalLayer = [CAMetalLayer layer];
     metalLayer.device = device;
-    metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    // Extended dynamic range: a half-float drawable in an extended-LINEAR
+    // colorspace. Values above 1.0 drive the display brighter than reference
+    // white, so the Doppler-boosted inner limb can actually glare on an XDR
+    // panel instead of being crushed into SDR white by the tonemapper.
+    metalLayer.pixelFormat = MTLPixelFormatRGBA16Float;
     metalLayer.framebufferOnly = NO;
+    metalLayer.wantsExtendedDynamicRangeContent = YES;
     metalLayer.drawableSize = CGSizeMake(drawableW, drawableH);
-    // The post pass gamma-encodes for sRGB; without an explicit colorspace the
-    // values would be interpreted in the display's native (wide) gamut.
-    CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    metalLayer.colorspace = srgb;
-    CGColorSpaceRelease(srgb);
+    CGColorSpaceRef xlin = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+    metalLayer.colorspace = xlin;
+    CGColorSpaceRelease(xlin);
     [view setLayer:metalLayer];
     [view setWantsLayer:YES];
 
@@ -541,6 +575,7 @@ public:
     ImGui::CreateContext();
     ImGui_ImplGlfw_InitForOther(window, true);
     ImGui_ImplMetal_Init(device);
+    linearizeImGuiStyle();
   }
 
   void createResources() {
@@ -574,7 +609,8 @@ public:
     struct Snap {
       vec3 pos, target;
       float spin, charge, density, r_out, temp, jets, nebula, scint, boost;
-      int lens, beaming, stars, disk, gravity;
+      float t_r0, t_h, t_l0, t_alpha, t_absorb, t_temp, t_dens, edr;
+      int lens, beaming, stars, disk, gravity, dmodel;
       int w, h;
     } s;
     memset(&s, 0, sizeof(s));
@@ -586,6 +622,11 @@ public:
     s.nebula = g_sim.enNebula ? g_sim.nebulaIntensity : 0.0f;
     s.scint = g_sim.enScintillation ? g_sim.starScintillation : 0.0f;
     s.boost = g_sim.photonRingBoost;
+    s.t_r0 = g_sim.torusR0; s.t_h = g_sim.torusH; s.t_l0 = g_sim.torusL0;
+    s.t_alpha = g_sim.torusAlpha; s.t_absorb = g_sim.torusAbsorb;
+    s.t_temp = g_sim.torusTemp; s.t_dens = g_sim.torusDensity;
+    s.edr = g_sim.enEDR ? edrHeadroom : 1.0f;
+    s.dmodel = g_sim.diskModel;
     s.lens = g_sim.lensMode; s.beaming = g_sim.beamingMode;
     s.stars = g_sim.enStarBodies ? 1 : 0; s.disk = g_sim.enDisk ? 1 : 0;
     // N-body star motion is deliberately NOT hashed: the stars crawl a few
@@ -687,6 +728,21 @@ public:
     bool jitterOn = accumAlpha < 0.999f;
     sysPtr->jitter_x     = jitterOn ? halton((frameCount % 64) + 1, 2) - 0.5f : 0.0f;
     sysPtr->jitter_y     = jitterOn ? halton((frameCount % 64) + 1, 3) - 0.5f : 0.0f;
+    // EDR headroom tracks display brightness/ambient, so re-query it live.
+    if (frameCount % 30 == 1) {
+      NSScreen *scr = [glfwGetCocoaWindow(winRef) screen] ?: [NSScreen mainScreen];
+      float hr = (float)scr.maximumExtendedDynamicRangeColorComponentValue;
+      edrHeadroom = std::clamp(hr, 1.0f, 16.0f);
+    }
+    sysPtr->edr_headroom = g_sim.enEDR ? edrHeadroom : 1.0f;
+    sysPtr->disk_model   = g_sim.diskModel;
+    sysPtr->torus_r0     = std::clamp(g_sim.torusR0, 2.0f, 30.0f);
+    sysPtr->torus_h      = std::clamp(g_sim.torusH, 0.0f, 12.0f);
+    sysPtr->torus_l0     = std::clamp(g_sim.torusL0, 0.0f, 6.0f);
+    sysPtr->torus_alpha  = std::clamp(g_sim.torusAlpha, -3.0f, 3.0f);
+    sysPtr->torus_absorb = std::clamp(g_sim.torusAbsorb, 0.0f, 8.0f);
+    sysPtr->torus_temp   = std::clamp(g_sim.torusTemp, 1000.0f, 20000.0f);
+    sysPtr->torus_density = std::clamp(g_sim.torusDensity, 0.0f, 4.0f);
     sysPtr->lens_mode    = g_sim.lensMode;
     sysPtr->beaming_mode = g_sim.beamingMode;
     sysPtr->star_bodies  = g_sim.enStarBodies ? 1 : 0;
@@ -876,7 +932,7 @@ public:
       if (captureThisFrame) {
           captureW = drawable.texture.width;
           captureH = drawable.texture.height;
-          captureBpr = captureW * 4;
+          captureBpr = captureW * 8;   // RGBA16Float
           captureReadback = [device newBufferWithLength:captureBpr * captureH
                                                 options:MTLResourceStorageModeShared];
 
@@ -913,19 +969,30 @@ public:
           FILE *f = (fd >= 0) ? fdopen(fd, "wb") : nullptr;
           if (f) {
               fprintf(f, "P6\n%lu %lu\n255\n", captureW, captureH);
+              // The drawable is extended-linear half-float. PPM is an SDR
+              // container, so encode the [0,1] range with the sRGB transfer
+              // function and report the true peak — values above 1.0 are the
+              // EDR highlights the display shows but the file cannot hold.
               std::vector<uint8_t> rgb(captureW * captureH * 3);
               uint8_t *dst = rgb.data();
+              float peak = 0.0f;
               for (NSUInteger y = 0; y < captureH; y++) {
-                  const uint8_t *row = data + y * captureBpr;
+                  const __fp16 *row = (const __fp16 *)(data + y * captureBpr);
                   for (NSUInteger x = 0; x < captureW; x++) {
-                      *dst++ = row[x * 4 + 2];  // R
-                      *dst++ = row[x * 4 + 1];  // G
-                      *dst++ = row[x * 4 + 0];  // B
+                      for (int k = 0; k < 3; k++) {
+                          float v = (float)row[x * 4 + k];
+                          peak = std::max(peak, v);
+                          float c = std::clamp(v, 0.0f, 1.0f);
+                          c = (c <= 0.0031308f) ? c * 12.92f
+                                                : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+                          *dst++ = (uint8_t)(c * 255.0f + 0.5f);
+                      }
                   }
               }
               fwrite(rgb.data(), 1, rgb.size(), f);
               fclose(f);
-              printf("Capture frame %d: %s (%lux%lu)\n", frameCount, path, captureW, captureH);
+              printf("Capture frame %d: %s (%lux%lu) peak=%.3f headroom=%.2f\n",
+                     frameCount, path, captureW, captureH, peak, edrHeadroom);
           } else {
               if (fd >= 0) close(fd);
               printf("Failed to open %s for writing\n", path);
@@ -958,10 +1025,10 @@ public:
       // is the teaching point, made explicit by the critical-curve overlay).
       struct Marker { float r_rs; ImU32 col; const char* label; };
       Marker marks[] = {
-        { kr.r_horizon, IM_COL32(255,  70,  70, 200), "event horizon (coord.)" },
-        { 1.0f,         IM_COL32(190, 110, 255, 170), "ergosphere (equator)" },
-        { kr.r_photon,  IM_COL32(255, 210,  80, 200), "photon orbit" },
-        { kr.r_isco,    IM_COL32( 90, 220, 140, 200), "ISCO" },
+        { kr.r_horizon, linCol(255,  70,  70, 200), "event horizon (coord.)" },
+        { 1.0f,         linCol(190, 110, 255, 170), "ergosphere (equator)" },
+        { kr.r_photon,  linCol(255, 210,  80, 200), "photon orbit" },
+        { kr.r_isco,    linCol( 90, 220, 140, 200), "ISCO" },
       };
       int n_marks = (std::abs(spin) > 0.01f) ? 4 : 4;
       for (int m = 0; m < n_marks; m++) {
@@ -1005,10 +1072,10 @@ public:
           float ax = (ab.x * 0.5f) / d_rs * lapse;
           float by = (ab.y * 0.5f) / d_rs * lapse * (below ? -1.0f : 1.0f);
           ImVec2 p(bhScreen.x - ax * pxPerRadX, bhScreen.y - by * pxPerRadY);
-          if (havePrev) dl->AddLine(prev, p, IM_COL32(80, 255, 120, 220), 1.5f);
+          if (havePrev) dl->AddLine(prev, p, linCol(80, 255, 120, 220), 1.5f);
           prev = p; havePrev = true;
         }
-        dl->AddText(ImVec2(bhScreen.x + 8, bhScreen.y + 8), IM_COL32(80, 255, 120, 220),
+        dl->AddText(ImVec2(bhScreen.x + 8, bhScreen.y + 8), linCol(80, 255, 120, 220),
                     "critical curve (analytic shadow edge)");
       }
     }
@@ -1016,47 +1083,47 @@ public:
     // Lens legends: every false-color lens ships with its colorbar + caption.
     if (g_sim.lensMode == LENS_RING_ORDER) {
       ImVec2 o(12, winScaleY - 116);
-      dl->AddRectFilled(ImVec2(o.x - 6, o.y - 6), ImVec2(o.x + 330, o.y + 106), IM_COL32(0, 0, 0, 160), 6.0f);
+      dl->AddRectFilled(ImVec2(o.x - 6, o.y - 6), ImVec2(o.x + 330, o.y + 106), linCol(0, 0, 0, 160), 6.0f);
       struct { ImU32 c; const char* t; } rows[] = {
-        { IM_COL32(230, 158,  20, 255), "n = 0  direct disk image" },
-        { IM_COL32( 26, 191, 217, 255), "n = 1  lensed (far side / underside)" },
-        { IM_COL32(204,  51, 217, 255), "n = 2  photon-ring image" },
-        { IM_COL32(242,  26,  38, 255), "n >= 3" },
-        { IM_COL32( 89, 107, 140, 255), "absorbed in foreground (jet/glow)" },
+        { linCol(230, 158,  20, 255), "n = 0  direct disk image" },
+        { linCol( 26, 191, 217, 255), "n = 1  lensed (far side / underside)" },
+        { linCol(204,  51, 217, 255), "n = 2  photon-ring image" },
+        { linCol(242,  26,  38, 255), "n >= 3" },
+        { linCol( 89, 107, 140, 255), "absorbed in foreground (jet/glow)" },
       };
       for (int i = 0; i < 5; i++) {
         dl->AddRectFilled(ImVec2(o.x, o.y + i * 20), ImVec2(o.x + 14, o.y + 14 + i * 20), rows[i].c);
-        dl->AddText(ImVec2(o.x + 20, o.y + i * 20), IM_COL32(235, 235, 235, 255), rows[i].t);
+        dl->AddText(ImVec2(o.x + 20, o.y + i * 20), linCol(235, 235, 235, 255), rows[i].t);
       }
-      dl->AddText(ImVec2(12, winScaleY - 136), IM_COL32(255, 255, 255, 220),
+      dl->AddText(ImVec2(12, winScaleY - 136), linCol(255, 255, 255, 220),
                   "Image order = number of equatorial crossings before the disk hit");
     } else if (g_sim.lensMode == LENS_REDSHIFT) {
       ImVec2 o(12, winScaleY - 64);
-      dl->AddRectFilled(ImVec2(o.x - 6, o.y - 26), ImVec2(o.x + 276, o.y + 30), IM_COL32(0, 0, 0, 160), 6.0f);
+      dl->AddRectFilled(ImVec2(o.x - 6, o.y - 26), ImVec2(o.x + 276, o.y + 30), linCol(0, 0, 0, 160), 6.0f);
       for (int i = 0; i < 256; i++) {
         float t = i / 255.0f;
         float g = 0.4f + 1.2f * t;
         ImU32 c;
-        if (g < 1.0f) { float u = (g - 0.4f) / 0.6f; c = IM_COL32((int)(217 + (242 - 217) * u), (int)(26 + (242 - 26) * u), (int)(23 + (242 - 23) * u), 255); }
-        else          { float u = (g - 1.0f) / 0.6f; c = IM_COL32((int)(242 - (242 - 33) * u), (int)(242 - (242 - 77) * u), (int)(242 - (242 - 227) * u), 255); }
+        if (g < 1.0f) { float u = (g - 0.4f) / 0.6f; c = linCol((int)(217 + (242 - 217) * u), (int)(26 + (242 - 26) * u), (int)(23 + (242 - 23) * u), 255); }
+        else          { float u = (g - 1.0f) / 0.6f; c = linCol((int)(242 - (242 - 33) * u), (int)(242 - (242 - 77) * u), (int)(242 - (242 - 227) * u), 255); }
         dl->AddRectFilled(ImVec2(o.x + i, o.y), ImVec2(o.x + i + 1, o.y + 14), c);
       }
-      dl->AddText(ImVec2(o.x, o.y - 20), IM_COL32(255, 255, 255, 220), "g = E_obs / E_emit (redshift factor at first disk hit)");
-      dl->AddText(ImVec2(o.x - 2, o.y + 14), IM_COL32(235, 235, 235, 255), "0.4");
-      dl->AddText(ImVec2(o.x + 120, o.y + 14), IM_COL32(235, 235, 235, 255), "1.0");
-      dl->AddText(ImVec2(o.x + 244, o.y + 14), IM_COL32(235, 235, 235, 255), "1.6");
+      dl->AddText(ImVec2(o.x, o.y - 20), linCol(255, 255, 255, 220), "g = E_obs / E_emit (redshift factor at first disk hit)");
+      dl->AddText(ImVec2(o.x - 2, o.y + 14), linCol(235, 235, 235, 255), "0.4");
+      dl->AddText(ImVec2(o.x + 120, o.y + 14), linCol(235, 235, 235, 255), "1.0");
+      dl->AddText(ImVec2(o.x + 244, o.y + 14), linCol(235, 235, 235, 255), "1.6");
     } else if (g_sim.lensMode == LENS_CHECKER) {
-      dl->AddText(ImVec2(12, winScaleY - 40), IM_COL32(255, 255, 255, 220),
+      dl->AddText(ImVec2(12, winScaleY - 40), linCol(255, 255, 255, 220),
                   "Checkerboard sky: each repeated red patch is another image order of the point behind the camera");
     } else if (g_sim.lensMode == LENS_EHT) {
-      dl->AddText(ImVec2(12, winScaleY - 40), IM_COL32(255, 220, 160, 230),
+      dl->AddText(ImVec2(12, winScaleY - 40), linCol(255, 220, 160, 230),
                   "EHT view: image convolved with the telescope restoring beam (beam FWHM slider)");
       // Beam-size glyph, radio-paper style.
       float d_rs = glm::length(camera.position()) / (float)SagA_rs;
       float thf = tanf(radians(30.0f));
       float pxPerRad = winScaleY * 0.5f / thf;
       float beamPx = (g_sim.ehtBeamFwhm / d_rs) * pxPerRad * 0.5f;
-      dl->AddCircle(ImVec2(40, winScaleY - 80), std::max(beamPx, 2.0f), IM_COL32(255, 255, 255, 180), 32, 1.5f);
+      dl->AddCircle(ImVec2(40, winScaleY - 80), std::max(beamPx, 2.0f), linCol(255, 255, 255, 180), 32, 1.5f);
     }
 
     if (g_sim.ovGeodesicFan) {
@@ -1075,15 +1142,15 @@ public:
         return ImVec2(p0.x + (w.x + 16.0f) / 32.0f * side,
                       p0.y + (16.0f - w.y) / 32.0f * side);
       };
-      fdl->AddRectFilled(p0, ImVec2(p0.x + side, p0.y + side), IM_COL32(8, 8, 14, 255));
+      fdl->AddRectFilled(p0, ImVec2(p0.x + side, p0.y + side), linCol(8, 8, 14, 255));
       // Reference circles: horizon (filled), photon orbit, ISCO.
       ImVec2 c = toScreen(ImVec2(0, 0));
       float pxPerRs = side / 32.0f;
-      fdl->AddCircleFilled(c, kr.r_horizon * pxPerRs, IM_COL32(30, 30, 34, 255), 48);
-      fdl->AddCircle(c, kr.r_photon * pxPerRs, IM_COL32(255, 210, 80, 160), 48, 1.0f);
-      fdl->AddCircle(c, kr.r_isco * pxPerRs, IM_COL32(90, 220, 140, 160), 48, 1.0f);
+      fdl->AddCircleFilled(c, kr.r_horizon * pxPerRs, linCol(30, 30, 34, 255), 48);
+      fdl->AddCircle(c, kr.r_photon * pxPerRs, linCol(255, 210, 80, 160), 48, 1.0f);
+      fdl->AddCircle(c, kr.r_isco * pxPerRs, linCol(90, 220, 140, 160), 48, 1.0f);
       for (auto& ray : fanRays) {
-        ImU32 col = ray.fate == 1 ? IM_COL32(242, 80, 60, 200) : IM_COL32(110, 190, 255, 170);
+        ImU32 col = ray.fate == 1 ? linCol(242, 80, 60, 200) : linCol(110, 190, 255, 170);
         for (size_t i = 1; i < ray.pts.size(); i++) {
           fdl->AddLine(toScreen(ray.pts[i - 1]), toScreen(ray.pts[i]), col, 1.0f);
         }
@@ -1105,6 +1172,7 @@ public:
             g_sim.enNebula = false; g_sim.enScintillation = false; g_sim.enVignette = false;
             g_sim.enGrid = false; g_sim.photonRingBoost = 0.0f;
             g_sim.lensMode = LENS_STANDARD; g_sim.beamingMode = BEAM_FULL;
+            g_sim.diskModel = DISK_THIN;
         };
         if (ImGui::Button("Schwarzschild")) {
             physicsBase();
@@ -1152,10 +1220,22 @@ public:
             camera.elevation = 0.30f;   // ~17 deg inclination (EHT M87*)
         }
         ImGui::SameLine();
+        if (ImGui::Button("Volumetric torus")) {
+            physicsBase();
+            g_sim.blackHoleSpin = 0.9f; g_sim.blackHoleCharge = 0.0f;
+            g_sim.enCharge = false; g_sim.enJets = false;
+            g_sim.diskModel = DISK_VOLUMETRIC;
+            g_sim.torusR0 = 7.0f; g_sim.torusH = 6.0f; g_sim.torusL0 = 1.0f;
+            g_sim.torusAlpha = 0.0f; g_sim.torusAbsorb = 1.0f;
+            g_sim.torusDensity = 1.0f; g_sim.torusTemp = 6500.0f;
+            camera.elevation = 1.15f;
+        }
+        ImGui::SameLine();
         if (ImGui::Button("Luminet 1979")) {
             physicsBase();
             g_sim.blackHoleSpin = 0.0f; g_sim.blackHoleCharge = 0.0f;
             g_sim.enCharge = false; g_sim.enJets = false;
+            g_sim.diskModel = DISK_THIN;
             camera.elevation = 1.40f;   // near edge-on, the classic view
         }
     }
@@ -1172,12 +1252,33 @@ public:
         ImGui::Checkbox("N-Body Gravitation", &g_sim.Gravity);
     }
 
-    if (ImGui::CollapsingHeader("Accretion Disk", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextWrapped("Novikov-Thorne thin disk: Page-Thorne flux (zero at ISCO, peak at 49/36 r_in), blackbody color with the full g-factor temperature shift.");
-        ImGui::SliderFloat("Surface Brightness", &g_sim.diskDensity, 0.0f, 1.0f);
-        ImGui::SameLine(); ImGui::Checkbox("##enDisk", &g_sim.enDisk);
-        ImGui::SliderFloat("Outer Radius (rs)", &g_sim.diskOuterRadius, 4.0f, 24.0f);
-        ImGui::SliderFloat("Peak Temp (K)", &g_sim.diskTempK, 1000.0f, 20000.0f);
+    if (ImGui::CollapsingHeader("Accretion Flow", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const char* models[] = { "Thin disk (Novikov-Thorne surface)",
+                                 "Volumetric torus (GRMHD-style)" };
+        ImGui::Combo("Model", &g_sim.diskModel, models, 2);
+        if (g_sim.diskModel == DISK_THIN) {
+            ImGui::TextWrapped("Optically-thick surface at the equator: Page-Thorne flux (zero at ISCO, peak at 49/36 r_in), blackbody color with the full g-factor temperature shift.");
+            ImGui::SliderFloat("Surface Brightness", &g_sim.diskDensity, 0.0f, 1.0f);
+            ImGui::SameLine(); ImGui::Checkbox("##enDisk", &g_sim.enDisk);
+            ImGui::SliderFloat("Outer Radius (rs)", &g_sim.diskOuterRadius, 4.0f, 24.0f);
+            ImGui::SliderFloat("Peak Temp (K)", &g_sim.diskTempK, 1000.0f, 20000.0f);
+        } else {
+            ImGui::TextWrapped("Optically-thin plasma torus integrated with the covariant radiative-transfer equation d(I/nu^3)/dlambda = j/nu^2 - (nu alpha) I/nu^3. Geometry and rotation law follow the EHT code-comparison parameterization (Gold et al. 2020).");
+            ImGui::SliderFloat("Emission Scale", &g_sim.torusDensity, 0.0f, 4.0f);
+            ImGui::SliderFloat("Ring Radius (M)", &g_sim.torusR0, 2.0f, 30.0f);
+            ImGui::SliderFloat("Vertical Compression", &g_sim.torusH, 0.0f, 12.0f);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+                "0 = spherical envelope; larger values flatten it into a torus.");
+            ImGui::SliderFloat("Angular Momentum l0", &g_sim.torusL0, 0.0f, 6.0f);
+            ImGui::SliderFloat("Spectral Index", &g_sim.torusAlpha, -3.0f, 3.0f);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+                "j_nu ~ nu^-alpha. At alpha = -2 the Doppler boost cancels\n"
+                "exactly against the frequency dependence and the image\n"
+                "becomes symmetric despite relativistic rotation\n"
+                "(the Gold et al. 2020 Test 2 identity).");
+            ImGui::SliderFloat("Absorption", &g_sim.torusAbsorb, 0.0f, 8.0f);
+            ImGui::SliderFloat("Color Temp (K)", &g_sim.torusTemp, 1000.0f, 20000.0f);
+        }
     }
 
     if (ImGui::CollapsingHeader("Learning", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1235,6 +1336,12 @@ public:
         ImGui::SameLine(); ImGui::Checkbox("##enGrain", &g_sim.enFilmGrain);
         ImGui::SliderFloat("Vignette", &g_sim.vignetteIntensity, 0.0f, 1.0f);
         ImGui::SameLine(); ImGui::Checkbox("##enVig", &g_sim.enVignette);
+        ImGui::Checkbox("Extended dynamic range (HDR)", &g_sim.enEDR);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Lets the tonemap shoulder run past reference white so the\n"
+            "Doppler-boosted inner limb glares on an XDR display.");
+        ImGui::Text("  display headroom: %.2fx %s", edrHeadroom,
+                    edrHeadroom > 1.05f ? "(EDR active)" : "(SDR)");
     }
 
     ImGui::Separator();
@@ -1346,6 +1453,10 @@ int main() {
   if (const char* e = getenv("BH_LENS"))   g_sim.lensMode = std::clamp(atoi(e), 0, 4);
   if (const char* e = getenv("BH_BEAMING"))g_sim.beamingMode = std::clamp(atoi(e), 0, 2);
   if (getenv("BH_JETS")) g_sim.enJets = true;
+  if (const char* e = getenv("BH_MODEL")) g_sim.diskModel = std::clamp(atoi(e), 0, 1);
+  if (const char* e = getenv("BH_ALPHA")) g_sim.torusAlpha = (float)atof(e);
+  if (const char* e = getenv("BH_ABSORB")) g_sim.torusAbsorb = (float)atof(e);
+  if (getenv("BH_NOEDR")) g_sim.enEDR = false;
   if (const char* e = getenv("BH_OVERLAYS")) {   // any of: m(arkers) c(ritical) f(an) g(rid)
     g_sim.ovMarkers       = strchr(e, 'm') != nullptr;
     g_sim.ovCriticalCurve = strchr(e, 'c') != nullptr;

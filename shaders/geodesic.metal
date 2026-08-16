@@ -346,6 +346,98 @@ static float3 disk_surface_emission(
     return chroma * Fn * boost * outer_fade * sys.disk_density * 18.0f;
 }
 
+// =====================================================================
+// Optically-thin volumetric plasma torus with covariant radiative transfer.
+//
+// Geometry and flow follow the EHT code-comparison parameterization
+// (Gold et al. 2020, ApJ 897:148) — an analytic stand-in for a GRMHD
+// snapshot with the same qualitative structure, and the setup that paper
+// uses for its cross-code imaging tests:
+//
+//   n(r, th) = n0 exp(-[((r - r0)/w)^2 + (h cos th)^2] / 2),  w = 0.4 r0
+//   l(R)     = (l0 / (1 + R)) R^(3/2),   R = r sin th
+//
+// (Gold et al. write the radial factor as exp(-(r/r0)^2/2), which peaks at
+// the origin — fine for their test geometry, where the peak sits inside the
+// horizon, but it renders as central fog rather than a torus. A Gaussian
+// RING at r0 is the standard analytic stand-in and changes none of the
+// transport physics: the Doppler-cancellation identity below is a property
+// of the frequency dependence, not of the density profile.)
+//
+// l is the specific angular momentum -u_phi/u_t, which fixes the orbital
+// frequency from the metric alone:
+//
+//   Omega = -(g_tphi + l g_tt) / (g_phph + l g_tphi)
+//
+// — a genuinely non-Keplerian rotating flow, unlike the thin disk.
+//
+// Transport is the covariant radiative-transfer equation in INVARIANT
+// form (Mihalas & Mihalas; the formulation ipole/RAPTOR integrate):
+//
+//   d(I_nu / nu^3)/dlambda = (j_nu / nu^2) - (nu alpha_nu)(I_nu / nu^3)
+//
+// with fluid-frame quantities evaluated at nu' = nu_obs / g. Writing the
+// power-law emissivity j_nu = C n nu^-alpha_s in invariant form gives
+//
+//   J_inv = C n g^(alpha_s + 2),   A_inv = A C n g^(alpha_s + 1.5)
+//
+// so the Doppler asymmetry EMERGES from the transport instead of being
+// applied by hand — and at alpha_s = -2 it cancels exactly, the
+// non-trivial symmetry of Gold et al. Test 2 that the suite checks.
+//
+// Color remains the documented visible-light remap: a blackbody at the
+// g-shifted local temperature, as for the thin disk.
+// =====================================================================
+
+struct TorusSample {
+    float n;        // density (normalized to 1 at the torus core)
+    float g;        // redshift factor nu_obs / nu_emit
+    float T;        // local (unshifted) color temperature
+};
+
+static inline bool torus_sample(float r_rs, float cos_th, float sin_th,
+                                KerrConst k, constant SystemUniforms& sys,
+                                thread TorusSample& out)
+{
+    // The literature parameterization is in M units; ours is rs = 2M.
+    float r_M   = 2.0f * r_rs;
+    float R_cyl = r_M * sin_th;
+
+    float r0 = max(sys.torus_r0, 0.5f);
+    float ar = (r_M - r0) / (0.4f * r0);
+    float az = sys.torus_h * cos_th;
+    float n  = exp(-0.5f * (ar * ar + az * az));
+    if (n < 2.0e-3f) return false;                 // outside the emitting body
+
+    // Specific angular momentum (M units) -> rs units (l has dimension length).
+    float l_rs = 0.5f * (sys.torus_l0 / (1.0f + R_cyl)) * pow(max(R_cyl, 1e-4f), 1.5f);
+
+    // Kerr-Newman metric components at this point (general theta, rs units).
+    float Sigma  = kerr_Sigma(r_rs, cos_th, k.a2);
+    float s2     = max(sin_th * sin_th, 1e-6f);
+    float m_kn   = r_rs - k.Q2;
+    float gtt    = -(1.0f - m_kn / Sigma);
+    float gtphi  = -k.a * m_kn * s2 / Sigma;
+    float gphph  = ((r_rs * r_rs + k.a2) * Sigma + k.a2 * m_kn * s2) * s2 / Sigma;
+
+    // l = -u_phi/u_t  =>  Omega, then the four-velocity normalization.
+    float denom = gphph + l_rs * gtphi;
+    denom = (abs(denom) > 1e-9f) ? denom : copysign(1e-9f, denom);
+    float Omega = -(gtphi + l_rs * gtt) / denom;
+
+    float U_denom = -(gtt + 2.0f * Omega * gtphi + Omega * Omega * gphph);
+    if (U_denom <= 1e-6f) return false;            // spacelike flow: no emitter
+    float Ut = rsqrt(U_denom);
+
+    // Same covariant redshift as the thin disk, with the torus Omega:
+    //   g = 1 / [u^t (1 - Omega xi)],  xi = L/E the photon impact ratio.
+    out.g = 1.0f / max(Ut * (1.0f - Omega * k.L_arr), 1e-3f);
+    out.n = n;
+    // Visible-light color remap: hotter toward the centre (virial scaling).
+    out.T = sys.torus_temp * sqrt(max(sys.torus_r0, 0.5f) / max(r_M, 1.0f));
+    return true;
+}
+
 kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
                      constant CameraData& cam [[buffer(0)]],
                      const device SimObject* objs [[buffer(1)]],
@@ -453,6 +545,11 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
     int   crossings = 0;         // equatorial crossings BEFORE the accepted hit
     int   hit_order = -1;        // image order n of the accepted disk hit
     float hit_g     = 1.0f;      // g-factor at the accepted disk hit
+    float g_accum   = 0.0f;      // emission-weighted g (volumetric lens readout)
+    float g_weight  = 0.0f;
+    // Volumetric emitting body extent: the density profile is Gaussian, so
+    // 4 scale radii is where n falls below the 2e-3 sampling threshold.
+    const float vol_r_max = 0.5f * (sys.torus_r0 * 2.4f) + 1.0f;
     int   fate      = 0;         // 0 = budget exhausted, 1 = captured, 2 = escaped,
                                  // 3 = disk hit, 4 = absorbed in foreground media
 
@@ -491,6 +588,12 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
                    + fabs(d.ph) * sin_th_rate + 1e-9f;
         float dlam = 0.05f / rate;
         dlam = min(dlam, 0.35f * max(s.r - r_horizon, 1e-3f) / max(fabs(d.r), 1e-6f));
+        // Volumetric mode integrates an extended emitting body rather than a
+        // surface: cap the step so the density profile is sampled, not
+        // stepped over. (The geometry-driven controller alone would take
+        // dlam ~ 0.05 r, far too coarse across the torus.)
+        if (sys.disk_model == DISK_VOLUMETRIC && s.r < vol_r_max)
+            dlam = min(dlam, 0.35f);
         dlam = max(dlam, 1e-4f);
 
         s = kerr_rk4(s, dlam, kerr);
@@ -518,8 +621,43 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
         // (descending prev_cos > 0 > cos_th and ascending prev_cos < 0 < cos_th):
         // the denominator |prev_cos| + |cos_th| never vanishes inside this branch.
         bool just_crossed = (prev_cos * cos_th < 0.0f);
-        if (just_crossed) {
-            crossings++;
+        if (just_crossed) crossings++;
+
+        // ----- Optically-thin volumetric transport (GRMHD-style). -----
+        if (sys.disk_model == DISK_VOLUMETRIC && s.r < vol_r_max && s.r > r_horizon * 1.05f) {
+            float sin_th_v = sqrt(max(1.0f - cos_th * cos_th, 0.0f));
+            TorusSample ts;
+            if (torus_sample(s.r, cos_th, sin_th_v, kerr, sys, ts)) {
+                // Emissivity scales with n^2 (two-body process, as for
+                // free-free emission) — this is what concentrates the light
+                // at the density peak instead of smearing it along the long
+                // optically-thin sight lines through the envelope.
+                float ne2 = ts.n * ts.n;
+                float ga = sys.torus_alpha;
+                float J_inv = ne2 * pow(ts.g, ga + 2.0f);
+                float A_inv = sys.torus_absorb * ne2 * pow(ts.g, ga + 1.5f);
+
+                float T_obs = (sys.beaming_mode == BEAM_NONE) ? ts.T : ts.g * ts.T;
+                float3 chroma = blackbody_color(T_obs);
+                if (sys.beaming_mode == BEAM_NO_BOOST) {
+                    // Colour shift only: divide out the transport's own g
+                    // dependence so intensity is Doppler-flat.
+                    J_inv = ts.n;
+                }
+                float dI = J_inv * dlam * sys.torus_density * 1.2f;
+                col_accum += trans * chroma * dI;
+
+                // Emission-weighted redshift for the diagnostic lens.
+                g_weight += dI * trans;
+                g_accum  += ts.g * dI * trans;
+                if (hit_order < 0) { hit_order = crossings; fate = 3; }
+
+                if (A_inv > 0.0f) trans *= exp(-A_inv * dlam * sys.torus_density);
+            }
+        }
+
+        // ----- Thin-disk surface intersection (optically thick). -----
+        if (just_crossed && sys.disk_model == DISK_THIN) {
             float f     = clamp(prev_cos / (prev_cos - cos_th), 0.0f, 1.0f);
             float r_at  = mix(prev_r,  s.r,  f);
             float ph_at = mix(prev_ph, s.ph, f);
@@ -653,6 +791,8 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
         col_accum += trans * bg;
     }
 
+    if (sys.disk_model == DISK_VOLUMETRIC && g_weight > 0.0f) hit_g = g_accum / g_weight;
+
     // ----- Lens output. -----
     float3 col = col_accum;
     if (sys.lens_mode == LENS_RING_ORDER) {
@@ -712,6 +852,37 @@ kernel void temporal_accum(texture2d<float, access::read> curTex [[texture(0)]],
 
 static inline float luma709(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
 
+// Colors authored as display (sRGB) values -> linear, for the extended-linear
+// drawable. The compositor applies the transfer function, so everything the
+// shader writes must be scene-linear.
+static inline float3 srgb_to_linear(float3 c) {
+    return select(c / 12.92f, pow((c + 0.055f) / 1.055f, 2.4f), c > 0.04045f);
+}
+
+static inline float3 aces_fit(float3 x) {
+    const float a = 2.51f, b = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
+    return (x * (a * x + b)) / (x * (c * x + d) + e);
+}
+
+// EDR tonemap = the SDR look, plus real highlights.
+//
+// Naively retargeting the curve (H * ACES(x/H)) moves the shoulder out to H
+// but drags the midtones down with it — middle gray falls from 0.267 to 0.071
+// at H = 16, darkening the whole image. Instead: keep the ACES result
+// bit-for-bit below the knee (where essentially the entire image lives), and
+// re-expand only the band the SDR curve was crushing into the last few
+// percent below reference white. The expansion is driven by the LINEAR
+// signal so highlight detail survives instead of flat-clipping, and it grows
+// logarithmically, so even a 500x input lands at ~4x white rather than H.
+static inline float3 tonemap_edr(float3 x, float H) {
+    float3 sdr = saturate(aces_fit(x));
+    if (H <= 1.001f) return sdr;                  // SDR display: unchanged
+    const float x_knee = 2.0f;                    // linear value where ACES saturates
+    float3 over = max(x - x_knee, 0.0f);
+    float3 ext  = log2(1.0f + over) * 0.35f;      // gentle above-white lift
+    return min(sdr + ext, H);
+}
+
 kernel void post_process_suite(texture2d<float, access::read> inTex [[texture(0)]],
                                texture2d<float, access::write> outTex [[texture(1)]],
                                texture2d<float, access::sample> bloomTex [[texture(2)]],
@@ -725,7 +896,7 @@ kernel void post_process_suite(texture2d<float, access::read> inTex [[texture(0)
 
     // False-color lenses are display-referred: bypass the photographic chain.
     if (sys.lens_mode == LENS_RING_ORDER || sys.lens_mode == LENS_REDSHIFT) {
-        outTex.write(float4(pow(max(col, 0.0f), 0.4545f), 1.0f), pix);
+        outTex.write(float4(srgb_to_linear(max(col, 0.0f)), 1.0f), pix);
         return;
     }
 
@@ -734,7 +905,7 @@ kernel void post_process_suite(texture2d<float, access::read> inTex [[texture(0)
     if (sys.lens_mode == LENS_EHT) {
         float lum = luma709(bloomTex.sample(sampler(filter::linear), uv).rgb) * sys.exposure;
         float t = lum / (1.0f + lum);          // soft normalize into [0,1)
-        outTex.write(float4(pow(hot_map(t * 1.6f), 0.4545f), 1.0f), pix);
+        outTex.write(float4(srgb_to_linear(hot_map(t * 1.6f)), 1.0f), pix);
         return;
     }
 
@@ -760,18 +931,21 @@ kernel void post_process_suite(texture2d<float, access::read> inTex [[texture(0)
         col *= max(vignette, 0.0f);
     }
 
-    // ACES filmic tonemap (Narkowicz fit)
-    float a = 2.51f; float b = 0.03f; float c = 2.43f; float d = 0.59f; float e = 0.14f;
-    col = clamp((col*(a*col+b))/(col*(c*col+d)+e), 0.0f, 1.0f);
+    // ACES filmic tonemap, extended to the display's EDR headroom. On an XDR
+    // panel the Doppler-boosted inner limb genuinely emits above reference
+    // white instead of being crushed to it.
+    col = tonemap_edr(col, sys.edr_headroom);
 
     // Film grain rides on developed density: after the tonemap, scaled by a
     // photographic sqrt-luminance response (no black-floor lift on empty sky).
     if (sys.film_grain > 0.0f) {
         float g = (hash13(float3(uv * 100.0f, sys.time)) - 0.5f) * sys.film_grain;
-        col = clamp(col + g * sqrt(max(luma709(col), 0.0f)), 0.0f, 1.0f);
+        col = max(col + g * sqrt(max(luma709(col), 0.0f)), 0.0f);
     }
 
-    outTex.write(float4(pow(col, 0.4545f), 1.0f), pix);
+    // Scene-linear out: the drawable is extended-linear and the compositor
+    // applies the transfer function.
+    outTex.write(float4(col, 1.0f), pix);
 }
 
 // --- BLOOM / BEAM EXTRACTION ---
@@ -967,7 +1141,7 @@ fragment float4 grid_fragment(VertexOut in [[stage_in]],
     col = mix(col,
               float3(1.0f, 0.3f, 0.05f),
               smoothstep(0.3f, 0.75f, d));
-    col *= 1.5f + d * 1.5f;
+    col = srgb_to_linear(col) * (1.5f + d * 1.5f);   // linear target
     float alpha = smoothstep(0.008f, 0.06f, d) * mix(0.5f, 0.9f, d);
     return float4(col, alpha);
 }

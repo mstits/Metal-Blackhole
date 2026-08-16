@@ -46,6 +46,10 @@ struct CameraData {
 #define BEAM_NO_BOOST    1   // temperature shift only (color, no intensity change)
 #define BEAM_NONE        2   // no shift, no boost (Luminet-style bolometric render)
 
+// Accretion-flow models (SystemUniforms::disk_model).
+#define DISK_THIN        0   // optically-thick Novikov-Thorne surface at theta = pi/2
+#define DISK_VOLUMETRIC  1   // optically-thin plasma torus, covariant radiative transfer
+
 struct SystemUniforms {
     float time;
     float spin;             // a/M in [-1, 1]; negative = retrograde disk
@@ -70,11 +74,23 @@ struct SystemUniforms {
     float accum_alpha;      // temporal blend weight: 1 = replace, <1 = accumulate
     float jitter_x;         // subpixel jitter in [-0.5, 0.5] (Halton, per frame)
     float jitter_y;
-    float _padf;
+    float edr_headroom;     // display EDR headroom: 1 = SDR, >1 = highlights above
+                            // reference white (Liquid Retina XDR reports ~4-16)
+    // Volumetric torus (EHT code-comparison parameterization, M units).
+    float torus_r0;         // radial density scale
+    float torus_h;          // vertical compression (0 = spherical, larger = thinner)
+    float torus_l0;         // specific-angular-momentum normalization
+    float torus_alpha;      // emissivity spectral index alpha_s: j_nu ~ nu^-alpha_s
+    float torus_absorb;     // absorption scale A (0 = optically thin)
+    float torus_temp;       // visible-light color temperature at the density peak
+    float torus_density;    // overall emission scale
+    float _padf1;
     int   enable_bloom;     // 0 = bloom pipeline contributes nothing; 1 = active
     int   lens_mode;        // LENS_* above
     int   beaming_mode;     // BEAM_* above
     int   star_bodies;      // 1 = render + lens the N-body companion stars
+    int   disk_model;       // DISK_* above
+    int   _padi[3];
 };
 
 struct ObjectsUniform {
