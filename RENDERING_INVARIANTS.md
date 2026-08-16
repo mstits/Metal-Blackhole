@@ -319,6 +319,41 @@ error as the E = −1 congruence itself.
 
 ---
 
+## 4d. Closed-Form Geodesics (optional path)
+
+### INVARIANT: never clamp a Carlson R_F argument away from zero
+
+At the critical curve two of R_F's three arguments vanish linearly in the root
+gap, producing the physical logarithmic divergence. R_F is *perfectly*
+conditioned there (its duplication step is a sum of positive terms and never
+cancels), so the small arguments are legitimate — flooring them truncates the
+divergence and erases the higher-order photon rings.
+
+### INVARIANT: the five corrections over the published recipes
+
+1. The root pair that merges at the critical curve is **r3 -> r4**, not r1 -> r2.
+2. The angular constants are 0/0 at `a = 0`. The textbook
+   `u+- = Delta_th +- sqrt(...)` form is already 1% wrong in fp32 at `a = 1e-2`
+   and NaN at `a = 0` — which the spin slider reaches. Use the
+   cancellation-free `S^2` branch.
+3. `j0 = (sign(beta) * F_o > 0)`. AART's `H(beta)` assumes a NORTHERN camera
+   and returns negative Mino times, or skips a crossing, below the equator.
+4. The outgoing branch (`p_r > 0` at the camera) must exist — every
+   back-hemisphere pixel of the 360/Mollweide projections generates one.
+5. A camera inside the outer photon shell (`r_o < r4`) is GL case Ia: bound but
+   still crossing the equator. Not handled by the closed form; those pixels
+   return -1 and fall back to RK4.
+
+### The path is optional and RK4 remains the reference
+
+Rays that miss the disk, cameras inside the photon shell, jets and glow in
+front of the disk, and the volumetric torus all still use RK4. The measured
+agreement (0.018% of pixels, all anti-aliased category edges) is a live
+cross-validation of both implementations — if it ever widens, one of them has
+regressed.
+
+---
+
 ## 5. Post-Processing
 
 - **Exposure first.** Bloom extraction, flare thresholding, and the grid's

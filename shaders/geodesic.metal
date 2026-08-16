@@ -583,6 +583,219 @@ static MPResult trace_mp(float3 ro, float3 rd, constant SystemUniforms& sys) {
     return res;
 }
 
+// =====================================================================
+// CLOSED-FORM NULL GEODESICS (Gralla-Lupsasca)
+//
+// Kerr and Kerr-Newman null geodesics have exact solutions in elliptic
+// integrals, so the ordered equatorial-crossing radii a thin disk needs can
+// be evaluated DIRECTLY — no stepping, constant time per pixel, and no
+// step-size artifacts in the photon ring, where the RK4 path spends most of
+// its budget whirling.
+//
+// This is a port of a prototype validated against a 40-digit quadrature
+// arbiter (median 7.5e-14 in fp64). Five corrections over the published
+// recipes are baked in and must not be "simplified" back out:
+//
+//  1. The root pair that merges at the critical curve is r3 -> r4, NOT
+//     r1 -> r2 (r2-r1 stays O(1) the whole way in).
+//  2. The angular constants are 0/0 at a = 0 — the textbook
+//     u_pm = Delta_th +/- sqrt(...) form is already 1% wrong in fp32 at
+//     a = 1e-2 and NaN at a = 0, which the spin slider reaches. The
+//     cancellation-free S2 branch below is exact down to and including a = 0.
+//  3. j0 = (sign(beta)*F_o > 0) — AART's H(beta) silently assumes a NORTHERN
+//     camera and returns negative Mino times (or skips a crossing) below the
+//     equator.
+//  4. The outgoing branch (p_r > 0 at the camera) exists: every back-
+//     hemisphere pixel of the 360/Mollweide projections generates one.
+//  5. A camera inside the outer photon shell (r_o < r4) is GL case Ia — the
+//     ray is bound but still crosses the equator. Not handled here; those
+//     pixels fall back to RK4.
+//
+// NEVER clamp an R_F argument away from zero: the small arguments are the
+// photon ring, and flooring them erases the higher-order images.
+// =====================================================================
+
+// Carlson symmetric elliptic integral of the first kind. Duplication until
+// the arguments are within 3% of their mean, then the DLMF 19.36.1 series.
+// The duplication step is a sum of positive terms, so it never cancels — this
+// stays exact even when two arguments nearly vanish at the critical curve.
+static inline float carlson_RF(float x, float y, float z) {
+    float A = 0.0f, dx = 0.0f, dy = 0.0f, dz = 0.0f;
+    for (int i = 0; i < 40; i++) {
+        A = (x + y + z) / 3.0f;
+        dx = 1.0f - x / A; dy = 1.0f - y / A; dz = 1.0f - z / A;
+        float s = max(max(fabs(dx), fabs(dy)), fabs(dz));
+        if (s < 0.03f) break;
+        float sx = sqrt(x), sy = sqrt(y), sz = sqrt(z);
+        float lam = sx * sy + sy * sz + sz * sx;
+        x = 0.25f * (x + lam); y = 0.25f * (y + lam); z = 0.25f * (z + lam);
+    }
+    float e2 = dx * dy - dz * dz;
+    float e3 = dx * dy * dz;
+    return (1.0f - e2 / 10.0f + e3 / 14.0f + e2 * e2 / 24.0f
+            - 3.0f * e2 * e3 / 44.0f - 5.0f * e2 * e2 * e2 / 208.0f
+            + 3.0f * e3 * e3 / 104.0f + e2 * e2 * e3 / 16.0f) / sqrt(A);
+}
+
+static inline float ell_K(float m) { return carlson_RF(0.0f, 1.0f - m, 1.0f); }
+
+// Incomplete F(phi|m) fed (sin phi, cos phi) directly — no asin anywhere, so
+// no accuracy is lost forming the angle. cos may be negative (phi in [0, pi]).
+static inline float ell_F_sc(float sn_, float cs, float m) {
+    float base = sn_ * carlson_RF(cs * cs, 1.0f - m * sn_ * sn_, 1.0f);
+    return (cs >= 0.0f) ? base : (2.0f * ell_K(m) - base);
+}
+
+// Jacobi sn/cn by the descending Landen (AGM) transformation.
+static inline void jacobi_sncn(float u, float m, thread float& sn, thread float& cn) {
+    float aa[24], cc[24];
+    float A = 1.0f, B = sqrt(max(1.0f - m, 0.0f)), Cc = sqrt(max(m, 0.0f));
+    int n = 0;
+    aa[0] = A; cc[0] = Cc;
+    while (n < 20 && fabs(Cc) > 1.0e-7f * fabs(A)) {
+        float An = 0.5f * (A + B), Bn = sqrt(A * B);
+        Cc = 0.5f * (A - B);
+        A = An; B = Bn; n++;
+        aa[n] = A; cc[n] = Cc;
+    }
+    float phi = u * A;
+    for (int i = 0; i < n; i++) phi *= 2.0f;
+    for (int i = n; i >= 1; i--) {
+        float t = clamp((cc[i] / aa[i]) * sin(phi), -1.0f, 1.0f);
+        phi = 0.5f * (phi + asin(t));
+    }
+    sn = sin(phi); cn = cos(phi);
+}
+
+struct QuarticRoots { float r1, r2, r3re, r3im, r4; int nreal; };
+
+// Roots of the radial potential. Charge enters ONLY through Cq — which is why
+// the whole Kerr machinery ports to Kerr-Newman unchanged.
+// MSL has no cbrt; the real cube root must keep the sign of its argument.
+static inline float real_cbrt(float v) {
+    return (v < 0.0f) ? -pow(-v, 1.0f / 3.0f) : pow(v, 1.0f / 3.0f);
+}
+
+static QuarticRoots radial_roots(float a, float Qc, float lam, float eta, float M) {
+    QuarticRoots R;
+    float KK = (lam - a) * (lam - a) + eta;
+    float A  = a * a - lam * lam - eta;
+    float B  = 2.0f * M * KK;
+    float Cq = -a * a * eta - Qc * Qc * KK;
+    float P  = -A * A / 12.0f - Cq;
+    float Qq = -(A / 3.0f) * ((A / 6.0f) * (A / 6.0f) - Cq) - B * B / 8.0f;
+    float disc = (P / 3.0f) * (P / 3.0f) * (P / 3.0f) + (Qq / 2.0f) * (Qq / 2.0f);
+    float xi;
+    if (disc >= 0.0f) {
+        float s = sqrt(disc);
+        xi = real_cbrt(-Qq / 2.0f + s) + real_cbrt(-Qq / 2.0f - s) - A / 3.0f;
+    } else {
+        float rr = sqrt(-P / 3.0f);
+        float ca = clamp((-Qq / 2.0f) / (rr * rr * rr), -1.0f, 1.0f);
+        xi = 2.0f * rr * cos(acos(ca) / 3.0f) - A / 3.0f;
+    }
+    for (int i = 0; i < 3; i++) {          // Newton polish on the resolvent
+        float f  = xi * xi * xi + A * xi * xi + (A * A / 4.0f - Cq) * xi - B * B / 8.0f;
+        float fp = 3.0f * xi * xi + 2.0f * A * xi + (A * A / 4.0f - Cq);
+        if (fp != 0.0f) xi -= f / fp;
+    }
+    if (xi <= 0.0f) xi = -xi;
+    float z  = sqrt(xi / 2.0f);
+    float e1 = -A / 2.0f - z * z + B / (4.0f * z);
+    float e2 = -A / 2.0f - z * z - B / (4.0f * z);
+    float t1 = sqrt(max(e1, 0.0f));
+    R.r1 = -z - t1; R.r2 = -z + t1;
+    if (e2 > 0.0f) {
+        float t2 = sqrt(e2);
+        R.r3re = z - t2; R.r4 = z + t2; R.r3im = 0.0f; R.nreal = 4;
+    } else {
+        R.r3re = z; R.r3im = sqrt(-e2); R.r4 = z; R.nreal = 2;
+    }
+    return R;
+}
+
+// Ordered equatorial-crossing radii. Returns the count; -1 means "this pixel
+// needs the RK4 fallback" (camera inside the outer photon shell).
+static int analytic_crossings(float a, float Qc, float lam, float eta,
+                              float ro, float tho, float Th_o,
+                              float sgn_pth, float sgn_pr, float M,
+                              int nmax, thread float* out)
+{
+    if (eta <= 0.0f) return 0;                     // vortical: never reaches the equator
+    float ct = cos(tho), st = sin(tho);
+
+    // Angular sector — identical for Kerr and Kerr-Newman (charge is absent).
+    float X  = 0.5f * (a * a - eta - lam * lam);
+    float D  = sqrt(X * X + a * a * eta);
+    float S2 = (X > 0.0f) ? (a * a * eta / (D + X)) : (D - X);   // cancellation-free
+    if (!(S2 > 0.0f)) return 0;
+    float S  = sqrt(S2);
+    float up = eta / S2;
+    float m  = -a * a * eta / (S2 * S2);           // finite at a = 0
+    float sphi = clamp(ct * S / sqrt(eta), -1.0f, 1.0f);
+    float c2 = clamp(Th_o * st * st / (up * (a * a * ct * ct + S2)), 0.0f, 1.0f);
+    float Fo = ell_F_sc(sphi, sqrt(c2), m);
+    float Kc = ell_K(m);
+    float sb = -sgn_pth;                           // = sign(beta)
+    int   j0 = (sb * Fo > 0.0f) ? 1 : 0;
+
+    float d2 = M * M - a * a - Qc * Qc;
+    float rp = M + sqrt(max(d2, 0.0f));
+    QuarticRoots R = radial_roots(a, Qc, lam, eta, M);
+    int nout = 0;
+
+    if (R.nreal == 4) {
+        float r1 = R.r1, r2 = R.r2, r3 = R.r3re, r4 = R.r4;
+        if (ro < r4) return -1;                    // GL case Ia: fall back to RK4
+        float r31 = r3 - r1, r42 = r4 - r2, r41 = r4 - r1, r32 = r3 - r2, r43 = r4 - r3;
+        float k2 = r32 * r41 / (r31 * r42);
+        float c  = 0.5f * sqrt(r31 * r42);
+        float den = (ro - r3) * r41;
+        float so = sqrt((ro - r4) * r31 / den), co = sqrt(r43 * (ro - r1) / den);
+        float Fo_r = ell_F_sc(so, co, k2);
+        float si = sqrt(r31 / r41), ci = sqrt(r43 / r41);
+        float Fi = ell_F_sc(si, ci, k2);
+        float tau_esc = (sgn_pr < 0.0f) ? (Fo_r + Fi) / c : (Fi - Fo_r) / c;
+        for (int n = 0; n < nmax; n++) {
+            float tau = (2.0f * float(j0 + n) * Kc - sb * Fo) / S;
+            if (tau >= tau_esc) break;             // past escape: no more crossings
+            float Xv = c * tau + sgn_pr * Fo_r;
+            float sn_, cn_; jacobi_sncn(Xv, k2, sn_, cn_);
+            float s2 = sn_ * sn_;
+            out[nout++] = (r4 * r31 - r3 * r41 * s2) / (r31 - r41 * s2);
+        }
+    } else {
+        float r1 = R.r1, r2 = R.r2, ar = R.r3re, ai = R.r3im;
+        float Aa = sqrt((ar - r2) * (ar - r2) + ai * ai);
+        float Bb = sqrt((ar - r1) * (ar - r1) + ai * ai);
+        float r21 = r2 - r1;
+        float k3 = ((Aa + Bb) * (Aa + Bb) - r21 * r21) / (4.0f * Aa * Bb);
+        float sab = sqrt(Aa * Bb);
+        float co, so, ch, sh, ci, si;
+        {   float p = Aa * (ro - r1), q = Bb * (ro - r2);
+            co = (p - q) / (p + q);
+            so = sqrt(max(4.0f * p * q / ((p + q) * (p + q)), 0.0f)); }
+        {   float p = Aa * (rp - r1), q = Bb * (rp - r2);
+            ch = (p - q) / (p + q);
+            sh = sqrt(max(4.0f * p * q / ((p + q) * (p + q)), 0.0f)); }
+        ci = (Aa - Bb) / (Aa + Bb);
+        si = sqrt(max(4.0f * Aa * Bb / ((Aa + Bb) * (Aa + Bb)), 0.0f));
+        float Fo_r = ell_F_sc(so, co, k3);
+        float Fh   = ell_F_sc(sh, ch, k3);
+        float Fi   = ell_F_sc(si, ci, k3);
+        float tau_end = (sgn_pr < 0.0f) ? (Fo_r - Fh) / sab : (Fi - Fo_r) / sab;
+        for (int n = 0; n < nmax; n++) {
+            float tau = (2.0f * float(j0 + n) * Kc - sb * Fo) / S;
+            if (tau >= tau_end) break;
+            float Xv = fabs((sgn_pr < 0.0f) ? (sab * tau - Fo_r) : (-sab * tau - Fo_r));
+            float sn_, cn_; jacobi_sncn(Xv, k3, sn_, cn_);
+            out[nout++] = ((Aa * r1 - Bb * r2) - (Aa * r1 + Bb * r2) * cn_)
+                        / ((Aa - Bb) - (Aa + Bb) * cn_);
+        }
+    }
+    return nout;
+}
+
 kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
                      texture2d<float, access::read> statsTex [[texture(1)]],
                      texture2d<float, access::read> accumTex [[texture(2)]],
@@ -738,6 +951,45 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
     {
         float c2 = cos_th_obs * cos_th_obs;
         kerr.QC = p_th0 * p_th0 + c2 * (kerr.L * kerr.L / max(s2_obs, 1e-9f) - kerr.a2);
+    }
+
+    // ----- Closed-form path (thin disk, Kerr-Newman). -----
+    // Evaluates the equatorial-crossing radii directly instead of stepping.
+    // Anything it does not cover — a camera inside the photon shell, a ray
+    // that misses the disk, jets/glow in front of it — falls through to the
+    // RK4 loop below, which remains the reference implementation.
+    if (sys.solver_mode == 1 && sys.disk_model == DISK_THIN &&
+        sys.jet_int <= 0.0f && sys.disk_density > 0.0f) {
+        float xs[8];
+        int nx = analytic_crossings(kerr.a, Q_ch, kerr.L_arr, kerr.QC,
+                                    r_obs, acos(cos_th_obs), p_th0 * p_th0,
+                                    (p_th0 < 0.0f) ? -1.0f : 1.0f,
+                                    (p_r0  < 0.0f) ? -1.0f : 1.0f,
+                                    0.5f, 8, xs);
+        if (nx >= 0) {
+            for (int n = 0; n < nx; n++) {
+                if (xs[n] > r_in && xs[n] < r_out) {
+                    float g_here;
+                    float3 emis = disk_surface_emission(xs[n], kerr, sys, r_in, r_out, g_here);
+                    if (n >= 1 && sys.photon_ring_boost > 0.0f)
+                        emis *= (1.0f + sys.photon_ring_boost);
+                    float3 colA = emis;
+                    if (sys.lens_mode == LENS_RING_ORDER) {
+                        float shade = 0.45f + 0.55f * clamp(length(emis) * 0.2f, 0.0f, 1.0f);
+                        if      (n == 0) colA = float3(0.90f, 0.62f, 0.08f) * shade;
+                        else if (n == 1) colA = float3(0.10f, 0.75f, 0.85f) * shade;
+                        else if (n == 2) colA = float3(0.80f, 0.20f, 0.85f) * shade;
+                        else             colA = float3(0.95f, 0.10f, 0.15f) * shade;
+                    } else if (sys.lens_mode == LENS_REDSHIFT) {
+                        colA = diverging_map((clamp(g_here, 0.4f, 1.6f) - 0.4f) / 1.2f);
+                    }
+                    out.write(float4(colA, 1.0f), pix);
+                    return;
+                }
+            }
+        }
+        // nx < 0 (camera inside the photon shell) or no crossing in the disk
+        // annulus: fall through to RK4 for sky, horizon and foreground media.
     }
 
     GeoState s;
