@@ -1,6 +1,6 @@
 # Metal Blackhole
 
-A high-fidelity, real-time black hole visualization and learning tool for Apple Silicon via the Metal API. The engine integrates exact null geodesics per pixel in two different spacetimes — a single Kerr-Newman hole and an exact **Majumdar-Papapetrou binary** — renders either a Novikov-Thorne thin disk or an optically-thin plasma torus with full covariant radiative transfer, outputs true HDR on XDR displays, and includes a set of toggleable **learning lenses** — the same alternative visualizations researchers use in papers (photon-ring image orders, redshift maps, checkerboard lensing skies, EHT beam convolution) — validated against a 97-test analytic GR suite.
+A high-fidelity, real-time black hole visualization and learning tool for Apple Silicon via the Metal API. The engine integrates exact null geodesics per pixel in two different spacetimes — a single Kerr-Newman hole and an exact **Majumdar-Papapetrou binary** — renders either a Novikov-Thorne thin disk or an optically-thin plasma torus with full covariant radiative transfer, outputs true HDR on XDR displays, and includes a set of toggleable **learning lenses** — the same alternative visualizations researchers use in papers (photon-ring image orders, redshift maps, checkerboard lensing skies, EHT beam convolution) — validated against a 98-test analytic GR suite.
 <img width="1312" height="940" alt="blackhole_screenshot" src="https://github.com/user-attachments/assets/98ee9e2e-913c-41ba-a067-f5cb44b1712f" />
 
 ---
@@ -277,7 +277,7 @@ Spin and charge are jointly clamped to `a² + Q² ≤ 1` (no silent naked-singul
 
 ```bash
 python3 tests/validate_physics.py
-# Expected: 97 passed, 0 failed
+# Expected: 98 passed, 0 failed
 ```
 
 The suite mirrors the shader integrator in double precision (same ZAMO Kerr-Newman tetrad, same Hamiltonian RHS, same adaptive controller) and verifies it against closed-form GR:
@@ -307,6 +307,7 @@ The suite mirrors the shader integrator in double precision (same ZAMO Kerr-Newm
 | 21 | MP binary: `L_x` conserved, `\|ẋ\| = E` drift < 1e-6 (measured, not re-projected in the mirror), and exact `x → −x` reflection symmetry for equal masses | conservation / symmetry |
 | 22 | Wide-separation limit: each hole's shadow → the isolated `4m` value to 1 part in 10⁴ | asymptotics |
 | 23 | **Extremal-charge signature in the deflection**: MP-traced bending matches the exact extremal-RN quadrature to 1.1×10⁻⁴, and the second-order coefficient is `3π` — not Schwarzschild's `15π/4` | Darwin-type quadrature |
+| 24 | Photon-ring **Lyapunov exponent** `γ = E/(√2 m)` to 1.7×10⁻⁴ — the rate that sets how fast successive photon-ring images demagnify | closed form |
 
 ---
 
