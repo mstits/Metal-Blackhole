@@ -34,3 +34,7 @@ debug_ray.py
 
 # Debug symbols
 *.dSYM/
+
+# Python bytecode
+__pycache__/
+*.pyc
