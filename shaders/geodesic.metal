@@ -438,6 +438,26 @@ static inline bool torus_sample(float r_rs, float cos_th, float sin_th,
     return true;
 }
 
+static inline float luma709(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+// --- ADAPTIVE SAMPLING ---
+//
+// At a shadow boundary a pixel is genuinely BIMODAL: some sub-pixel rays are
+// captured (black), others reach the sky (bright). Its sample variance never
+// decays no matter how many samples are taken — but that pixel is not wrong,
+// it just needs enough samples to resolve its true area average. So the
+// stopping rule uses the variance OF THE MEAN (sigma^2/N), which does decay
+// as 1/N, rather than the sample variance. This is the only criterion that
+// terminates correctly at a fractal boundary, where neighbouring pixels
+// legitimately differ and no amount of smoothing is the right answer.
+static inline bool pixel_converged(float2 stats, float mean_luma, float tol) {
+    float N = stats.y;
+    if (N < 16.0f) return false;                       // always take a base budget
+    float var = stats.x / max(N - 1.0f, 1.0f);         // sample variance
+    float sem = sqrt(max(var, 0.0f) / N);              // standard error of the mean
+    return sem < tol * (mean_luma + 0.01f);            // relative, with a black floor
+}
+
 // =====================================================================
 // MAJUMDAR-PAPAPETROU: N extremally-charged black holes in exact static
 // equilibrium (an EXACT solution of Einstein-Maxwell, not a superposition
@@ -564,6 +584,8 @@ static MPResult trace_mp(float3 ro, float3 rd, constant SystemUniforms& sys) {
 }
 
 kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
+                     texture2d<float, access::read> statsTex [[texture(1)]],
+                     texture2d<float, access::read> accumTex [[texture(2)]],
                      constant CameraData& cam [[buffer(0)]],
                      const device SimObject* objs [[buffer(1)]],
                      constant ObjectsUniform& u_obj [[buffer(2)]],
@@ -571,6 +593,15 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
                      uint2 pix [[thread_position_in_grid]]) {
     uint w = out.get_width(); uint h = out.get_height();
     if (pix.x >= w || pix.y >= h) return;
+
+    // Refine pass: converged pixels cost one texture read instead of a full
+    // geodesic trace. Boundary pixels cluster on curves, so most threadgroups
+    // skip entirely; the ones that straddle a boundary pay for their slowest
+    // lane, which is the price of avoiding an indirect-dispatch compaction.
+    if (sys.accum_mode == ACCUM_REFINE) {
+        float2 stats = statsTex.read(pix).xy;
+        if (pixel_converged(stats, luma709(accumTex.read(pix).rgb), sys.refine_tol)) return;
+    }
 
     // Subpixel jitter (Halton, from the host): with temporal accumulation this
     // converges to supersampled ground truth on a static camera.
@@ -1016,22 +1047,48 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
 kernel void temporal_accum(texture2d<float, access::read> curTex [[texture(0)]],
                            texture2d<float, access::read> prevTex [[texture(1)]],
                            texture2d<float, access::write> outTex [[texture(2)]],
+                           texture2d<float, access::read_write> statsTex [[texture(3)]],
                            constant SystemUniforms& sys [[buffer(0)]],
-                           uint2 pix [[thread_position_in_grid]]) {
+                           device atomic_uint* activeCount [[buffer(1)]],
+                           uint2 pix [[thread_position_in_grid]],
+                           uint simd_lane [[thread_index_in_simdgroup]]) {
     uint w = outTex.get_width(); uint h = outTex.get_height();
     if (pix.x >= w || pix.y >= h) return;
     float3 cur  = curTex.read(pix).rgb;
     float3 prev = prevTex.read(pix).rgb;
     // Freshly created private textures have undefined contents; a NaN there
-    // would persist through mix() forever. Sanitize before blending.
+    // would persist forever. Sanitize before blending.
     if (any(isnan(prev)) || any(isinf(prev))) prev = cur;
-    float3 acc = mix(prev, cur, clamp(sys.accum_alpha, 0.0f, 1.0f));
-    outTex.write(float4(acc, 1.0f), pix);
+
+    if (sys.accum_mode == ACCUM_HOST_ALPHA) {
+        outTex.write(float4(mix(prev, cur, clamp(sys.accum_alpha, 0.0f, 1.0f)), 1.0f), pix);
+        return;
+    }
+
+    float2 stats = statsTex.read(pix).xy;              // (M2 of luma, N)
+    bool converged = (sys.accum_mode == ACCUM_REFINE) &&
+                     pixel_converged(stats, luma709(prev), sys.refine_tol);
+    // Count pixels still doing work, simd-reduced so each simdgroup issues at
+    // most one atomic. The host stops refining once this nears zero, so the
+    // pass budget is a ceiling rather than a fixed cost.
+    uint active = simd_sum(converged ? 0u : 1u);
+    if (simd_lane == 0u && active > 0u)
+        atomic_fetch_add_explicit(activeCount, active, memory_order_relaxed);
+    if (converged) {
+        outTex.write(float4(prev, 1.0f), pix);         // already converged: hold
+        return;
+    }
+    // Welford: numerically stable running mean and M2 in fp32 even at N ~ 1e3.
+    float N = stats.y + 1.0f;
+    float lp = luma709(prev), lc = luma709(cur);
+    float3 mean = (N <= 1.0f) ? cur : prev + (cur - prev) / N;
+    float d1 = lc - lp, d2 = lc - luma709(mean);
+    float M2 = (N <= 1.0f) ? 0.0f : stats.x + d1 * d2;
+    statsTex.write(float4(M2, N, 0.0f, 0.0f), pix);
+    outTex.write(float4(mean, 1.0f), pix);
 }
 
 // --- POST-PROCESSING ---
-
-static inline float luma709(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
 
 // Colors authored as display (sRGB) values -> linear, for the extended-linear
 // drawable. The compositor applies the transfer function, so everything the
