@@ -301,6 +301,22 @@ baked into a panorama is the classic VR discomfort trigger, and a 16:9
 so every caller inherits them. Export width is clamped to 16384 — Metal
 *aborts* on a larger texture descriptor rather than returning nil.
 
+### The conserved-quantity bridge (for anyone comparing against the literature)
+
+Papers state Kerr null geodesics with the future-directed `E = +1` normalization
+and the impact parameters `λ = L/E`, `η = Q_C/E²`. This project traces the
+past-directed ray with `E = −1`, so:
+
+```
+λ = −L_shader = L_arr      (exactly what zamo_init already returns)
+η =  QC_shader             (E² = 1, no rescaling)
+```
+
+Verified end-to-end: TEST 25 drives the integrator from published `(λ, η)`
+values and reproduces 40-digit crossing radii to ≤1.3e-6. Getting this bridge
+backwards silently mirrors every frame-dragging asymmetry — the same class of
+error as the E = −1 congruence itself.
+
 ---
 
 ## 5. Post-Processing
