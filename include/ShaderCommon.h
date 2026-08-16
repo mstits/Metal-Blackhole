@@ -55,6 +55,11 @@ struct CameraData {
 #define PROJ_EQUIRECT    1   // 360 lat-long (2:1), for VR / spherical video
 #define PROJ_MOLLWEIDE   2   // all-sky equal-area, as NASA publishes alongside 360s
 
+// Accumulation modes (SystemUniforms::accum_mode).
+#define ACCUM_HOST_ALPHA 0   // live path: host-driven exponential/progressive blend
+#define ACCUM_WELFORD    1   // offline: per-pixel running mean + M2 (all pixels)
+#define ACCUM_REFINE     2   // offline: same, but skip pixels already converged
+
 // Accretion-flow models (SystemUniforms::disk_model).
 #define DISK_THIN        0   // optically-thick Novikov-Thorne surface at theta = pi/2
 #define DISK_VOLUMETRIC  1   // optically-thin plasma torus, covariant radiative transfer
@@ -107,6 +112,10 @@ struct SystemUniforms {
     float mp_m2;            // mass of hole 2
     float mp_sep;           // coordinate separation along x
     float mp_glow;          // decorative near-horizon glow
+    float refine_tol;       // target relative standard error of the pixel mean
+    float _padf2[3];
+    int   accum_mode;       // ACCUM_* above
+    int   _padi2[3];
 };
 
 struct ObjectsUniform {

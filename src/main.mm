@@ -510,6 +510,8 @@ public:
   float currentExposure = 1.0f;
 
   id<MTLTexture> rtTex;               // raw raytrace output (this frame)
+  id<MTLTexture> statsTex;            // (M2 of luma, sample count) for adaptive sampling
+  id<MTLBuffer> liveActiveBuf;        // live path never refines; keeps the binding valid
   id<MTLTexture> accumTex[2];         // temporal accumulation ping-pong
   id<MTLTexture> bloomTex;
   id<MTLTexture> bloomBlurTex;
@@ -650,6 +652,8 @@ public:
       sysUniformBuffer[i] = [device newBufferWithLength:sizeof(SystemUniforms) options:MTLResourceStorageModeShared];
       gridUniformBuffer[i] = [device newBufferWithLength:sizeof(GridUniforms) options:MTLResourceStorageModeShared];
       lumBuffer[i] = [device newBufferWithLength:sizeof(uint32_t) * 2 options:MTLResourceStorageModeShared];
+      if (!liveActiveBuf) liveActiveBuf = [device newBufferWithLength:sizeof(uint32_t)
+                                                              options:MTLResourceStorageModeShared];
       memset(lumBuffer[i].contents, 0, sizeof(uint32_t) * 2);
     }
 
@@ -684,6 +688,12 @@ public:
     itd.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
     itd.storageMode = MTLStorageModePrivate;
     rtTex = [device newTextureWithDescriptor:itd];
+    MTLTextureDescriptor *std_ = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                     width:drawableW height:drawableH mipmapped:NO];
+    std_.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+    std_.storageMode = MTLStorageModePrivate;
+    statsTex = [device newTextureWithDescriptor:std_];
     accumTex[0] = [device newTextureWithDescriptor:itd];
     accumTex[1] = [device newTextureWithDescriptor:itd];
 
@@ -827,6 +837,8 @@ public:
     sysPtr->r_isco       = kr.r_isco;
     sysPtr->photon_ring_boost = std::clamp(g_sim.photonRingBoost, 0.0f, 4.0f);
     sysPtr->accum_alpha  = accumAlpha;
+    sysPtr->accum_mode   = ACCUM_HOST_ALPHA;
+    sysPtr->refine_tol   = 0.02f;
     // Subpixel jitter converges under accumulation; when history is being
     // REPLACED (camera moving), an uncompensated jitter just makes edges crawl
     // — render the unjittered center sample instead.
@@ -937,6 +949,8 @@ public:
       id<MTLComputeCommandEncoder> ray = [cmd computeCommandEncoder];
       [ray setComputePipelineState:raytracePSO];
       [ray setTexture:rtTex atIndex:0];
+      [ray setTexture:statsTex atIndex:1];
+      [ray setTexture:accumTex[1 - currentAccumIdx] atIndex:2];
       [ray setBuffer:camBuffer[currentFrame] offset:0 atIndex:0];
       [ray setBuffer:objBuffer offset:0 atIndex:1];
       [ray setBuffer:objUniformBuffer[currentFrame] offset:0 atIndex:2];
@@ -953,7 +967,9 @@ public:
         [ta setTexture:rtTex atIndex:0];
         [ta setTexture:accumTex[prevAcc] atIndex:1];
         [ta setTexture:accumTex[curAcc] atIndex:2];
+        [ta setTexture:statsTex atIndex:3];
         [ta setBuffer:sysUniformBuffer[currentFrame] offset:0 atIndex:0];
+        [ta setBuffer:liveActiveBuf offset:0 atIndex:1];
         [ta dispatchThreads:MTLSizeMake(drawableW, drawableH, 1) threadsPerThreadgroup:tpg];
         [ta endEncoding];
       }
@@ -1594,6 +1610,15 @@ public:
     id<MTLTexture> rt = [device newTextureWithDescriptor:td];
     id<MTLTexture> acc[2] = { [device newTextureWithDescriptor:td],
                               [device newTextureWithDescriptor:td] };
+    MTLTextureDescriptor *sd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                     width:W height:H mipmapped:NO];
+    sd.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+    sd.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> stats = [device newTextureWithDescriptor:sd];
+    id<MTLBuffer> activeBuf = [device newBufferWithLength:sizeof(uint32_t)
+                                                  options:MTLResourceStorageModeShared];
+    *(uint32_t *)activeBuf.contents = 0;
     id<MTLBuffer> camB = [device newBufferWithLength:sizeof(CameraData) options:MTLResourceStorageModeShared];
     id<MTLBuffer> sysB = [device newBufferWithLength:sizeof(SystemUniforms) options:MTLResourceStorageModeShared];
     id<MTLBuffer> objB = [device newBufferWithLength:sizeof(ObjectsUniform) options:MTLResourceStorageModeShared];
@@ -1621,17 +1646,29 @@ public:
     SystemUniforms *sp = (SystemUniforms *)sysB.contents;
     sp->projection = projection;
 
+    // Half the budget is spent uniformly to build a reliable variance estimate;
+    // the rest goes only to pixels whose mean has not converged. At a fractal
+    // shadow boundary that is exactly where the extra samples belong, and
+    // uniform spending would waste them on flat sky.
+    int base = std::max(16, samples / 2);
+    int total = samples * 3;                    // refine budget ceiling
+    sp->refine_tol = 0.015f;
+    if (const char* e = getenv("BH_REFINE_TOL")) sp->refine_tol = (float)atof(e);
+
     int cur = 0;
-    for (int i = 0; i < samples; i++) {
+    for (int i = 0; i < total; i++) {
       sp->jitter_x = halton(i + 1, 2) - 0.5f;
       sp->jitter_y = halton(i + 1, 3) - 0.5f;
       sp->accum_alpha = (i == 0) ? 1.0f : 1.0f / float(i + 1);
+      sp->accum_mode = (i < base) ? ACCUM_WELFORD : ACCUM_REFINE;
       @autoreleasepool {
         id<MTLCommandBuffer> cb = [commandQueue commandBuffer];
         MTLSize tpg = MTLSizeMake(32, 8, 1);
         id<MTLComputeCommandEncoder> ray = [cb computeCommandEncoder];
         [ray setComputePipelineState:raytracePSO];
         [ray setTexture:rt atIndex:0];
+        [ray setTexture:stats atIndex:1];
+        [ray setTexture:acc[1 - cur] atIndex:2];
         [ray setBuffer:camB offset:0 atIndex:0];
         [ray setBuffer:objBuffer offset:0 atIndex:1];
         [ray setBuffer:objB offset:0 atIndex:2];
@@ -1643,15 +1680,33 @@ public:
         [ta setTexture:rt atIndex:0];
         [ta setTexture:acc[1 - cur] atIndex:1];
         [ta setTexture:acc[cur] atIndex:2];
+        [ta setTexture:stats atIndex:3];
         [ta setBuffer:sysB offset:0 atIndex:0];
+        [ta setBuffer:activeBuf offset:0 atIndex:1];
         [ta dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:tpg];
         [ta endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
       }
       cur = 1 - cur;
-      if ((i + 1) % 32 == 0) { printf("  %d/%d\r", i + 1, samples); fflush(stdout); }
+      // Stop once almost nothing is still converging: the refine budget is a
+      // ceiling, not a fixed cost.
+      if (i >= base && (i - base) % 16 == 15) {
+        uint32_t active = *(uint32_t *)activeBuf.contents;
+        *(uint32_t *)activeBuf.contents = 0;
+        double frac = double(active) / (16.0 * double(W) * double(H));
+        if (frac < 0.0015) {
+          printf("  converged: %.3f%% of pixels still refining, stopped at %d samples\n",
+                 100.0 * frac, i + 1);
+          break;
+        }
+      }
+      if ((i + 1) % 32 == 0) {
+        printf("  %d/%d%s\r", i + 1, total, (i < base) ? " (base)" : " (refine)");
+        fflush(stdout);
+      }
     }
+    printf("  %d base + %d refine samples/px max\n", base, total - base);
     NSUInteger bpr = W * 8;
     id<MTLBuffer> rb = [device newBufferWithLength:bpr * H options:MTLResourceStorageModeShared];
     @autoreleasepool {
@@ -1671,6 +1726,7 @@ public:
     drawableW = w; drawableH = h;
     metalLayer.drawableSize = CGSizeMake(drawableW, drawableH);
     rtTex = nil;
+    statsTex = nil;
     accumTex[0] = nil;
     accumTex[1] = nil;
     bloomTex = nil;
