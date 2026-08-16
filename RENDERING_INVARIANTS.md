@@ -3,7 +3,7 @@
 Hard-won rules from debugging the geodesic integrator, the temporal pipeline,
 and the coordinate singularities. **Violating any of these will reintroduce
 visual or physics bugs.** Every invariant below is enforced or cross-checked by
-`tests/validate_physics.py` (87 tests) where a test can express it.
+`tests/validate_physics.py` (94 tests) where a test can express it.
 
 ---
 
@@ -230,6 +230,39 @@ The layer is `RGBA16Float` in extended-linear space, so the compositor applies
 the transfer function. Display-authored colors — the false-color lenses, the
 grid, ImGui's palette and every overlay `IM_COL32` — must be converted with
 `srgb_to_linear` / `linCol()` first, or the UI washes out.
+
+---
+
+## 4c. Majumdar-Papapetrou Binary
+
+### INVARIANT: the exact MP null-geodesic form
+
+`d²x^i/dλ² = (2/U)[E² ∂_i U − (∇U·ẋ)ẋ^i]`, with `ṫ = E U²` and the algebraic
+constraint `|ẋ| = E`. This was derived from the Lagrangian and **verified
+symbolically** against the full Christoffel computation (sympy, all three
+components identically zero after imposing the null condition). Do not
+"simplify" the second term away — it is what keeps the ray on the light cone.
+
+Camera setup is trivially simple in this chart and must stay that way: the
+static tetrad is `e_0 = U ∂_t`, `e_i = U⁻¹ ∂_i`, so choosing local energy
+`E_loc = U` gives `E = 1` and `ẋ = n`, the unit pixel direction itself.
+
+### INVARIANT: the shader re-projects |ẋ| = E, the test mirror does NOT
+
+The shader rescales `v` to `|v| = E` each step so round-off cannot drift rays
+off the light cone over the long chaotic orbits between the holes. The Python
+mirror deliberately leaves it free and **asserts the drift** instead
+(TEST 21), so the projection can never hide an integrator error.
+
+### INVARIANT: budget-exhausted rays are their own fate, not "captured"
+
+Rays trapped on long-lived chaotic orbits between the holes are what make the
+basin boundary fractal. Classifying them as captured would artificially fill
+in the shadow; they get their own category (yellow in the basin lens).
+
+Regressions: TEST 20 (b = 4m vs the independent Kerr-Newman path),
+TEST 21 (L_x, drift, exact x → −x mirror symmetry), TEST 22 (wide-separation
+limit to 1e-4).
 
 ---
 

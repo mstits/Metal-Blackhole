@@ -6,6 +6,8 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <QuartzCore/QuartzCore.h>
+#import <ImageIO/ImageIO.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
@@ -69,6 +71,12 @@ struct SimSettings {
   float vignetteIntensity  = 0.6f;
   float ehtBeamFwhm        = 2.6f;      // telescope beam FWHM in rs units
 
+  int  bhMode          = BH_KERR_NEWMAN;
+  int  projection      = PROJ_PERSPECTIVE;
+  float mpM1           = 0.25f;   // code units (rs = 2 M_total)
+  float mpM2           = 0.25f;
+  float mpSep          = 6.0f;
+  float mpGlow         = 0.5f;
   int  diskModel       = DISK_THIN;
   float torusR0        = 7.0f;     // ring radius (M units)
   float torusH         = 6.0f;
@@ -109,6 +117,9 @@ double lastFrameTime = 0.0;
 float deltaTime = 0.016f;
 int frameCount = 0;
 bool screenshotPending = false;
+bool exrPending = false;
+bool panoPending = false;    // 360 equirectangular panorama
+bool stillPending = false;   // high-resolution reference still
 // QA harness: BH_QA=1 captures a screenshot at frame 90 and exits at frame 100.
 // BH_ELEV / BH_AZIM / BH_SPIN / BH_CHARGE / BH_LENS override initial state.
 bool qaMode = false;
@@ -375,6 +386,41 @@ static void linearizeImGuiStyle() {
   }
 }
 
+// Write scene-linear half-float RGBA as an OpenEXR via ImageIO. The buffer is
+// the accumulated HDR render target, so the file holds true radiometric values
+// (highlights well above 1.0) with no tonemapping or UI baked in.
+static void writeEXR(id<MTLBuffer> buf, int w, int h, NSUInteger bpr, int samples) {
+  const char *dir = getenv("BH_SHOT_DIR");
+  char path[512];
+  snprintf(path, sizeof(path), "%s/bh_ref_%d_%d.exr",
+           dir ? dir : "/tmp", (int)getpid(), frameCount);
+  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+  CFDataRef data = CFDataCreate(NULL, (const UInt8 *)buf.contents, bpr * h);
+  CGDataProviderRef prov = CGDataProviderCreateWithCFData(data);
+  CGBitmapInfo bi = (CGBitmapInfo)kCGImageAlphaNoneSkipLast
+                  | kCGBitmapFloatComponents | kCGBitmapByteOrder16Little;
+  CGImageRef img = CGImageCreate(w, h, 16, 64, bpr, cs, bi, prov,
+                                 NULL, false, kCGRenderingIntentDefault);
+  bool ok = false;
+  if (img) {
+    CFStringRef url_s = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
+    CFURLRef url = CFURLCreateWithFileSystemPath(NULL, url_s, kCFURLPOSIXPathStyle, false);
+    CGImageDestinationRef dst =
+        CGImageDestinationCreateWithURL(url, CFSTR("com.ilm.openexr-image"), 1, NULL);
+    if (dst) {
+      CGImageDestinationAddImage(dst, img, NULL);
+      ok = CGImageDestinationFinalize(dst);
+      CFRelease(dst);
+    }
+    CFRelease(url); CFRelease(url_s);
+    CGImageRelease(img);
+  }
+  CGDataProviderRelease(prov); CFRelease(data); CGColorSpaceRelease(cs);
+  printf(ok ? "Reference EXR: %s (%dx%d, %d accumulated samples)\n"
+            : "Reference EXR FAILED: %s (%dx%d, %d samples)\n",
+         path, w, h, samples + 1);
+}
+
 // Halton low-discrepancy sequence for subpixel jitter.
 static float halton(int index, int base) {
   float f = 1.0f, r = 0.0f;
@@ -610,7 +656,8 @@ public:
       vec3 pos, target;
       float spin, charge, density, r_out, temp, jets, nebula, scint, boost;
       float t_r0, t_h, t_l0, t_alpha, t_absorb, t_temp, t_dens, edr;
-      int lens, beaming, stars, disk, gravity, dmodel;
+      float mp1, mp2, msep, mglow;
+      int lens, beaming, stars, disk, gravity, dmodel, bmode, proj;
       int w, h;
     } s;
     memset(&s, 0, sizeof(s));
@@ -627,6 +674,9 @@ public:
     s.t_temp = g_sim.torusTemp; s.t_dens = g_sim.torusDensity;
     s.edr = g_sim.enEDR ? edrHeadroom : 1.0f;
     s.dmodel = g_sim.diskModel;
+    s.bmode = g_sim.bhMode; s.proj = g_sim.projection;
+    s.mp1 = g_sim.mpM1; s.mp2 = g_sim.mpM2;
+    s.msep = g_sim.mpSep; s.mglow = g_sim.mpGlow;
     s.lens = g_sim.lensMode; s.beaming = g_sim.beamingMode;
     s.stars = g_sim.enStarBodies ? 1 : 0; s.disk = g_sim.enDisk ? 1 : 0;
     // N-body star motion is deliberately NOT hashed: the stars crawl a few
@@ -736,6 +786,12 @@ public:
     }
     sysPtr->edr_headroom = g_sim.enEDR ? edrHeadroom : 1.0f;
     sysPtr->disk_model   = g_sim.diskModel;
+    sysPtr->bh_mode      = g_sim.bhMode;
+    sysPtr->projection   = g_sim.projection;
+    sysPtr->mp_m1        = std::clamp(g_sim.mpM1, 0.0f, 2.0f);
+    sysPtr->mp_m2        = std::clamp(g_sim.mpM2, 0.0f, 2.0f);
+    sysPtr->mp_sep       = std::clamp(g_sim.mpSep, 0.0f, 40.0f);
+    sysPtr->mp_glow      = std::clamp(g_sim.mpGlow, 0.0f, 2.0f);
     sysPtr->torus_r0     = std::clamp(g_sim.torusR0, 2.0f, 30.0f);
     sysPtr->torus_h      = std::clamp(g_sim.torusH, 0.0f, 12.0f);
     sysPtr->torus_l0     = std::clamp(g_sim.torusL0, 0.0f, 6.0f);
@@ -923,6 +979,29 @@ public:
       ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cmd, ren);
       [ren endEncoding];
 
+      // Reference-still capture: the ACCUMULATED scene-linear HDR (pre-tonemap,
+      // pre-UI), written as a half-float OpenEXR. macOS ImageIO supports
+      // com.ilm.openexr-image natively, so this needs no third-party library.
+      bool exrThisFrame = exrPending;
+      if (exrThisFrame) exrPending = false;
+      id<MTLBuffer> exrReadback = nil;
+      NSUInteger exrBpr = 0;
+      if (exrThisFrame) {
+          exrBpr = drawableW * 8;   // RGBA16Float
+          exrReadback = [device newBufferWithLength:exrBpr * drawableH
+                                            options:MTLResourceStorageModeShared];
+          id<MTLBlitCommandEncoder> eb = [cmd blitCommandEncoder];
+          [eb copyFromTexture:accumTex[curAcc]
+                  sourceSlice:0 sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(drawableW, drawableH, 1)
+                     toBuffer:exrReadback
+            destinationOffset:0
+       destinationBytesPerRow:exrBpr
+     destinationBytesPerImage:exrBpr * drawableH];
+          [eb endEncoding];
+      }
+
       // Screenshot capture: blit in the SAME command buffer, before present.
       bool captureThisFrame = screenshotPending;
       if (captureThisFrame) screenshotPending = false;
@@ -955,6 +1034,11 @@ public:
           dispatch_semaphore_signal(sem);
       }];
       [cmd commit];
+
+      if (exrThisFrame) {
+          [cmd waitUntilCompleted];
+          writeEXR(exrReadback, drawableW, drawableH, exrBpr, accumN);
+      }
 
       if (captureThisFrame) {
           [cmd waitUntilCompleted];
@@ -1081,7 +1165,22 @@ public:
     }
 
     // Lens legends: every false-color lens ships with its colorbar + caption.
-    if (g_sim.lensMode == LENS_RING_ORDER) {
+    if (g_sim.lensMode == LENS_RING_ORDER && g_sim.bhMode == BH_MP_BINARY) {
+      ImVec2 o(12, winScaleY - 96);
+      dl->AddRectFilled(ImVec2(o.x - 6, o.y - 6), ImVec2(o.x + 360, o.y + 86), linCol(0, 0, 0, 160), 6.0f);
+      struct { ImU32 c; const char* t; } brows[] = {
+        { linCol(230,  89,  26), "captured by hole 1" },
+        { linCol( 26, 140, 230), "captured by hole 2" },
+        { linCol(242, 230,  51), "trapped (chaotic orbit, budget exhausted)" },
+        { linCol(140,  51, 166), "escaped, shaded by winding count" },
+      };
+      for (int i = 0; i < 4; i++) {
+        dl->AddRectFilled(ImVec2(o.x, o.y + i * 20), ImVec2(o.x + 14, o.y + 14 + i * 20), brows[i].c);
+        dl->AddText(ImVec2(o.x + 20, o.y + i * 20), linCol(235, 235, 235), brows[i].t);
+      }
+      dl->AddText(ImVec2(12, winScaleY - 116), linCol(255, 255, 255, 220),
+                  "Capture basins: the boundary between them is fractal");
+    } else if (g_sim.lensMode == LENS_RING_ORDER) {
       ImVec2 o(12, winScaleY - 116);
       dl->AddRectFilled(ImVec2(o.x - 6, o.y - 6), ImVec2(o.x + 330, o.y + 106), linCol(0, 0, 0, 160), 6.0f);
       struct { ImU32 c; const char* t; } rows[] = {
@@ -1172,7 +1271,7 @@ public:
             g_sim.enNebula = false; g_sim.enScintillation = false; g_sim.enVignette = false;
             g_sim.enGrid = false; g_sim.photonRingBoost = 0.0f;
             g_sim.lensMode = LENS_STANDARD; g_sim.beamingMode = BEAM_FULL;
-            g_sim.diskModel = DISK_THIN;
+            g_sim.diskModel = DISK_THIN; g_sim.bhMode = BH_KERR_NEWMAN;
         };
         if (ImGui::Button("Schwarzschild")) {
             physicsBase();
@@ -1220,6 +1319,18 @@ public:
             camera.elevation = 0.30f;   // ~17 deg inclination (EHT M87*)
         }
         ImGui::SameLine();
+        if (ImGui::Button("MP binary")) {
+            physicsBase();
+            g_sim.bhMode = BH_MP_BINARY;
+            g_sim.mpM1 = 0.25f; g_sim.mpM2 = 0.25f; g_sim.mpSep = 6.0f;
+            g_sim.mpGlow = 0.5f; g_sim.enNebula = true; g_sim.nebulaIntensity = 1.0f;
+            // View down the axis perpendicular to the separation, so both
+            // holes are equidistant and the eyebrow structure is symmetric.
+            camera.radius = (float)(SagA_rs * 14.0);
+            camera.elevation = 1.5708f;
+            camera.azimuth = 1.5708f;
+        }
+        ImGui::SameLine();
         if (ImGui::Button("Volumetric torus")) {
             physicsBase();
             g_sim.blackHoleSpin = 0.9f; g_sim.blackHoleCharge = 0.0f;
@@ -1241,6 +1352,23 @@ public:
     }
 
     if (ImGui::CollapsingHeader("General Relativity", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const char* spacetimes[] = { "Kerr-Newman (single hole)",
+                                     "Majumdar-Papapetrou binary" };
+        ImGui::Combo("Spacetime", &g_sim.bhMode, spacetimes, 2);
+        if (g_sim.bhMode == BH_MP_BINARY) {
+            ImGui::TextWrapped("Two extremally-charged holes in EXACT static equilibrium "
+                               "(gravity balanced by electrostatic repulsion). No Carter "
+                               "constant exists here: the capture basin is a chaotic "
+                               "scatterer with a fractal boundary and self-similar "
+                               "'eyebrows' facing each companion. Use the Image-order lens "
+                               "to see the basin structure, or the Checkerboard sky for the lensing.");
+            ImGui::SliderFloat("Mass 1", &g_sim.mpM1, 0.02f, 1.0f);
+            ImGui::SliderFloat("Mass 2", &g_sim.mpM2, 0.0f, 1.0f);
+            ImGui::SliderFloat("Separation", &g_sim.mpSep, 0.0f, 30.0f);
+            ImGui::SliderFloat("Horizon Glow", &g_sim.mpGlow, 0.0f, 2.0f);
+            ImGui::TextDisabled("  each hole: horizon (areal) = m, shadow b = 4m");
+            ImGui::Separator();
+        }
         ImGui::TextWrapped("Kerr-Newman metric parameters. Spin < 0 renders a retrograde disk (retrograde ISCO applies).");
         ImGui::SliderFloat("Black Hole Spin (a)", &g_sim.blackHoleSpin, -1.0f, 1.0f);
         ImGui::SliderFloat("Electric Charge (Q)", &g_sim.blackHoleCharge, 0.0f, 1.0f);
@@ -1287,6 +1415,11 @@ public:
                                  "Redshift map (g-factor)", "Checkerboard sky (lensing)",
                                  "EHT view (beam-blurred)" };
         ImGui::Combo("Lens", &g_sim.lensMode, lenses, 5);
+        const char* projs[] = { "Perspective", "360 equirectangular (VR)", "Mollweide all-sky" };
+        ImGui::Combo("Projection", &g_sim.projection, projs, 3);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Ray tracers get these almost free: only the pixel -> direction\n"
+            "mapping changes. Render 360 at 2:1 for spherical-video players.");
         if (g_sim.lensMode == LENS_EHT)
             ImGui::SliderFloat("Beam FWHM (rs)", &g_sim.ehtBeamFwhm, 0.5f, 8.0f);
         const char* beams[] = { "Full (g^4 + color shift)", "Color shift only", "Off (bolometric)" };
@@ -1370,6 +1503,93 @@ public:
     ImGui::End();
   }
 
+  // Offline reference-still export: render at arbitrary resolution and
+  // projection with N jittered accumulated samples, then write a scene-linear
+  // EXR plus a tonemapped PNG-able PPM. Independent of the live render
+  // targets, so a 360 panorama can be 2:1 regardless of the window.
+  void servicePendingExports() {
+    if (panoPending) {
+      panoPending = false;
+      int W = 4096, H = 2048;                    // 2:1, ~5.3 arcmin/pixel
+      if (const char* e = getenv("BH_PANO_W")) { W = atoi(e); H = W / 2; }
+      exportStill(W, H, 128, PROJ_EQUIRECT);
+    }
+    if (stillPending) {
+      stillPending = false;
+      int W = 3840, H = 2160;
+      if (const char* e = getenv("BH_STILL_W")) { W = atoi(e); H = W * 9 / 16; }
+      exportStill(W, H, 256, g_sim.projection);
+    }
+  }
+
+  void exportStill(int W, int H, int samples, int projection) {
+    printf("Reference still: %dx%d, %d samples, projection %d ...\n",
+           W, H, samples, projection);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                     width:W height:H mipmapped:NO];
+    td.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> rt = [device newTextureWithDescriptor:td];
+    id<MTLTexture> acc[2] = { [device newTextureWithDescriptor:td],
+                              [device newTextureWithDescriptor:td] };
+    id<MTLBuffer> camB = [device newBufferWithLength:sizeof(CameraData) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> sysB = [device newBufferWithLength:sizeof(SystemUniforms) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> objB = [device newBufferWithLength:sizeof(ObjectsUniform) options:MTLResourceStorageModeShared];
+    memcpy(camB.contents, camBuffer[currentFrame].contents, sizeof(CameraData));
+    memcpy(sysB.contents, sysUniformBuffer[currentFrame].contents, sizeof(SystemUniforms));
+    memcpy(objB.contents, objUniformBuffer[currentFrame].contents, sizeof(ObjectsUniform));
+    CameraData *cp = (CameraData *)camB.contents;
+    cp->aspect = float(W) / float(H);
+    SystemUniforms *sp = (SystemUniforms *)sysB.contents;
+    sp->projection = projection;
+
+    int cur = 0;
+    for (int i = 0; i < samples; i++) {
+      sp->jitter_x = halton(i + 1, 2) - 0.5f;
+      sp->jitter_y = halton(i + 1, 3) - 0.5f;
+      sp->accum_alpha = (i == 0) ? 1.0f : 1.0f / float(i + 1);
+      @autoreleasepool {
+        id<MTLCommandBuffer> cb = [commandQueue commandBuffer];
+        MTLSize tpg = MTLSizeMake(32, 8, 1);
+        id<MTLComputeCommandEncoder> ray = [cb computeCommandEncoder];
+        [ray setComputePipelineState:raytracePSO];
+        [ray setTexture:rt atIndex:0];
+        [ray setBuffer:camB offset:0 atIndex:0];
+        [ray setBuffer:objBuffer offset:0 atIndex:1];
+        [ray setBuffer:objB offset:0 atIndex:2];
+        [ray setBuffer:sysB offset:0 atIndex:3];
+        [ray dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:tpg];
+        [ray endEncoding];
+        id<MTLComputeCommandEncoder> ta = [cb computeCommandEncoder];
+        [ta setComputePipelineState:temporalPSO];
+        [ta setTexture:rt atIndex:0];
+        [ta setTexture:acc[1 - cur] atIndex:1];
+        [ta setTexture:acc[cur] atIndex:2];
+        [ta setBuffer:sysB offset:0 atIndex:0];
+        [ta dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:tpg];
+        [ta endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+      }
+      cur = 1 - cur;
+      if ((i + 1) % 32 == 0) { printf("  %d/%d\r", i + 1, samples); fflush(stdout); }
+    }
+    NSUInteger bpr = W * 8;
+    id<MTLBuffer> rb = [device newBufferWithLength:bpr * H options:MTLResourceStorageModeShared];
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb = [commandQueue commandBuffer];
+      id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+      [bl copyFromTexture:acc[1 - cur] sourceSlice:0 sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(W, H, 1)
+                 toBuffer:rb destinationOffset:0
+      destinationBytesPerRow:bpr destinationBytesPerImage:bpr * H];
+      [bl endEncoding];
+      [cb commit]; [cb waitUntilCompleted];
+    }
+    writeEXR(rb, W, H, bpr, samples - 1);
+  }
+
   void resize(int w, int h) {
     drawableW = w; drawableH = h;
     metalLayer.drawableSize = CGSizeMake(drawableW, drawableH);
@@ -1429,6 +1649,9 @@ void keyCallback(GLFWwindow *w, int key, int /*scancode*/, int action, int /*mod
   if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) glfwSetWindowShouldClose(w, GLFW_TRUE);
   if (ImGui::GetIO().WantCaptureKeyboard) return;
   if (key == GLFW_KEY_P && action == GLFW_PRESS) screenshotPending = true;
+  if (key == GLFW_KEY_E && action == GLFW_PRESS) exrPending = true;
+  if (key == GLFW_KEY_3 && action == GLFW_PRESS) panoPending = true;
+  if (key == GLFW_KEY_R && action == GLFW_PRESS) stillPending = true;
   // L cycles the learning lens.
   if (key == GLFW_KEY_L && action == GLFW_PRESS) g_sim.lensMode = (g_sim.lensMode + 1) % 5;
 }
@@ -1457,6 +1680,14 @@ int main() {
   if (const char* e = getenv("BH_ALPHA")) g_sim.torusAlpha = (float)atof(e);
   if (const char* e = getenv("BH_ABSORB")) g_sim.torusAbsorb = (float)atof(e);
   if (getenv("BH_NOEDR")) g_sim.enEDR = false;
+  if (const char* e = getenv("BH_BINARY")) {
+    g_sim.bhMode = BH_MP_BINARY; g_sim.mpSep = (float)atof(e);
+    g_sim.enNebula = true;
+  }
+  if (const char* e = getenv("BH_M2")) g_sim.mpM2 = (float)atof(e);
+  if (const char* e = getenv("BH_PROJ")) g_sim.projection = std::clamp(atoi(e), 0, 2);
+  if (const char* e = getenv("BH_RADIUS")) camera.radius = (float)(SagA_rs * atof(e));
+
   if (const char* e = getenv("BH_OVERLAYS")) {   // any of: m(arkers) c(ritical) f(an) g(rid)
     g_sim.ovMarkers       = strchr(e, 'm') != nullptr;
     g_sim.ovCriticalCurve = strchr(e, 'c') != nullptr;
@@ -1504,8 +1735,14 @@ int main() {
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
     engine.render((int)objects.size());
+    engine.servicePendingExports();
     if (qaMode) {
-      if (frameCount == 90) screenshotPending = true;
+      if (frameCount == 90) {
+        screenshotPending = true;
+        if (getenv("BH_EXR")) exrPending = true;
+        if (getenv("BH_PANO")) panoPending = true;
+        if (getenv("BH_STILL")) stillPending = true;
+      }
       if (frameCount >= 100) glfwSetWindowShouldClose(window, GLFW_TRUE);
     }
   }
