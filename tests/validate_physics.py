@@ -1199,6 +1199,43 @@ check_true(f"second-order coefficient -> 3pi = {3 * math.pi:.4f} (got {c2:.4f}),
            abs(c2 - 3 * math.pi) < abs(c2 - 15 * math.pi / 4))
 print()
 
+# --- TEST 24: photon-ring Lyapunov exponent, closed form ---
+print("TEST 24: MP photon-ring instability rate gamma = E/(sqrt(2) m)")
+print("-" * 40)
+# The critical circular null orbit sits at isotropic r = m (areal R = 2m). Its
+# instability exponent is what sets how fast successive photon-ring images
+# demagnify, so it is a sharper probe of the near-critical dynamics than the
+# capture boundary alone: b_crit only tests WHERE the orbit is, gamma tests how
+# the geodesic flow behaves around it.
+p = [m1 * (1.0 + 1e-9), 0.0, 0.0]
+v = [0.0, 1.0, 0.0]                    # tangential; L = U^2 m E = 4mE => b = b_crit
+hstep = 1e-4
+lam = 0.0
+xs, ys = [], []
+for _ in range(400000):
+    k1p, k1v = mp_rhs(p, v, 1.0, one_hole)
+    k2p, k2v = mp_rhs([p[i] + .5 * hstep * k1p[i] for i in range(3)],
+                      [v[i] + .5 * hstep * k1v[i] for i in range(3)], 1.0, one_hole)
+    k3p, k3v = mp_rhs([p[i] + .5 * hstep * k2p[i] for i in range(3)],
+                      [v[i] + .5 * hstep * k2v[i] for i in range(3)], 1.0, one_hole)
+    k4p, k4v = mp_rhs([p[i] + hstep * k3p[i] for i in range(3)],
+                      [v[i] + hstep * k3v[i] for i in range(3)], 1.0, one_hole)
+    p = [p[i] + hstep * (k1p[i] + 2 * k2p[i] + 2 * k3p[i] + k4p[i]) / 6 for i in range(3)]
+    v = [v[i] + hstep * (k1v[i] + 2 * k2v[i] + 2 * k3v[i] + k4v[i]) / 6 for i in range(3)]
+    lam += hstep
+    dev = abs(math.sqrt(sum(c * c for c in p)) - m1)
+    if 1e-8 < dev < 1e-2:
+        xs.append(lam); ys.append(math.log(dev))
+    if dev > 0.05 * m1:
+        break
+n = len(xs)
+mx = sum(xs) / n
+my = sum(ys) / n
+gamma = (sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
+         / sum((x - mx) ** 2 for x in xs))
+check(f"Lyapunov exponent (fit over {n} points)", gamma, 1.0 / (math.sqrt(2.0) * m1), 1e-3)
+print()
+
 # ============================================================
 #  SUMMARY
 # ============================================================
