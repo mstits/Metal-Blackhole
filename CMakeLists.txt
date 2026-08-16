@@ -43,6 +43,7 @@ target_include_directories(MetalBlackhole PRIVATE
 target_link_libraries(MetalBlackhole PRIVATE
     glfw
     glm::glm
+    z                    # zlib, for ZIP-compressed OpenEXR output
     ${METAL_FRAMEWORK}
     ${QUARTZCORE_FRAMEWORK}
     ${COCOA_FRAMEWORK}

@@ -1,6 +1,6 @@
 # Metal Blackhole
 
-A high-fidelity, real-time black hole visualization and learning tool for Apple Silicon via the Metal API. The engine integrates exact null geodesics per pixel in two different spacetimes — a single Kerr-Newman hole and an exact **Majumdar-Papapetrou binary** — renders either a Novikov-Thorne thin disk or an optically-thin plasma torus with full covariant radiative transfer, outputs true HDR on XDR displays, and includes a set of toggleable **learning lenses** — the same alternative visualizations researchers use in papers (photon-ring image orders, redshift maps, checkerboard lensing skies, EHT beam convolution) — validated against a 94-test analytic GR suite.
+A high-fidelity, real-time black hole visualization and learning tool for Apple Silicon via the Metal API. The engine integrates exact null geodesics per pixel in two different spacetimes — a single Kerr-Newman hole and an exact **Majumdar-Papapetrou binary** — renders either a Novikov-Thorne thin disk or an optically-thin plasma torus with full covariant radiative transfer, outputs true HDR on XDR displays, and includes a set of toggleable **learning lenses** — the same alternative visualizations researchers use in papers (photon-ring image orders, redshift maps, checkerboard lensing skies, EHT beam convolution) — validated against a 97-test analytic GR suite.
 <img width="1312" height="940" alt="blackhole_screenshot" src="https://github.com/user-attachments/assets/98ee9e2e-913c-41ba-a067-f5cb44b1712f" />
 
 ---
@@ -54,7 +54,10 @@ A high-fidelity, real-time black hole visualization and learning tool for Apple 
 
 ### Projections & Export
 - **Perspective**, **360° equirectangular** (2:1, for VR / spherical-video players), and **Mollweide** all-sky — a ray tracer gets these almost free, since only the pixel→direction mapping changes.
-- **Reference stills:** an offline exporter renders at arbitrary resolution and projection with N accumulated jittered samples, independent of the window, and writes a **scene-linear half-float OpenEXR** (via ImageIO's native `com.ilm.openexr-image` — no third-party dependency). The file holds true radiometric values with no tonemapping or UI baked in: a typical capture peaks near 28× reference white with ~19% of components above 1.0.
+- **Reference stills:** an offline exporter renders at arbitrary resolution and projection with N accumulated jittered samples, independent of the window, and writes a **bit-exact scene-linear half-float OpenEXR**. The file holds true radiometric values with no tonemapping or UI baked in: a typical capture peaks near 28× reference white with ~19% of components above 1.0.
+  - The EXR writer is vendored (`include/exr_out.h`, ~180 lines, libc + zlib) rather than using macOS ImageIO, which *can* write OpenEXR but runs pixels through an ICC transform first — measured here, that perturbs 35.5% of pixels and leaks nonzero values into channels whose source was exactly 0.0, so the shadow interior stops being exactly black. Disqualifying for reference data.
+  - **Panoramas are levelled**: spherical projections lock the pole to the spin axis and put the image centre on the horizontal, because a viewer in a headset cannot roll or pitch to compensate for a baked-in tilt. They are also forced to 2:1.
+  - Since ImageIO silently drops metadata from EXR, a panorama also gets a tonemapped 16-bit PNG companion carrying the **GPano XMP** so players recognise it as 360.
 
 ### Cinematic Suite
 - **ACES Filmic Tonemapping** with exposure applied before all display-referred effects.
@@ -274,7 +277,7 @@ Spin and charge are jointly clamped to `a² + Q² ≤ 1` (no silent naked-singul
 
 ```bash
 python3 tests/validate_physics.py
-# Expected: 94 passed, 0 failed
+# Expected: 97 passed, 0 failed
 ```
 
 The suite mirrors the shader integrator in double precision (same ZAMO Kerr-Newman tetrad, same Hamiltonian RHS, same adaptive controller) and verifies it against closed-form GR:
@@ -303,6 +306,7 @@ The suite mirrors the shader integrator in double precision (same ZAMO Kerr-Newm
 | 20 | **MP single hole = extremal Reissner-Nordström**: critical impact parameter `b = 4m` to 3×10⁻⁸ — reached through a completely independent formulation from the Carter-separated path that gets the same number in §6 | exact solution |
 | 21 | MP binary: `L_x` conserved, `\|ẋ\| = E` drift < 1e-6 (measured, not re-projected in the mirror), and exact `x → −x` reflection symmetry for equal masses | conservation / symmetry |
 | 22 | Wide-separation limit: each hole's shadow → the isolated `4m` value to 1 part in 10⁴ | asymptotics |
+| 23 | **Extremal-charge signature in the deflection**: MP-traced bending matches the exact extremal-RN quadrature to 1.1×10⁻⁴, and the second-order coefficient is `3π` — not Schwarzschild's `15π/4` | Darwin-type quadrature |
 
 ---
 

@@ -626,7 +626,11 @@ kernel void raytrace(texture2d<float, access::write> out [[texture(0)]],
                 float w8 = clamp(float(mp.crossings) * 0.2f, 0.0f, 1.0f);
                 col = mix(float3(0.05f, 0.06f, 0.10f), float3(0.55f, 0.20f, 0.65f), w8);
             }
-        } else if (mp.fate == 1) {
+        } else if (mp.fate != 2) {
+            // Captured OR budget-exhausted. A ray still whirling in the chaotic
+            // region between the holes is not looking at the sky — rendering it
+            // as background paints stars into exactly the fractal eyebrow region
+            // where it is most conspicuous.
             col = float3(0.0f);
         } else {
             col = (sys.lens_mode == LENS_CHECKER)
