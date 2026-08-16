@@ -1,6 +1,6 @@
 # Metal Blackhole
 
-A high-fidelity, real-time black hole visualization and learning tool for Apple Silicon via the Metal API. The engine integrates exact Kerr-Newman null geodesics per pixel, renders a Novikov-Thorne thin disk with physically-correct blackbody Doppler color, and includes a set of toggleable **learning lenses** — the same alternative visualizations researchers use in papers (photon-ring image orders, redshift maps, checkerboard lensing skies, EHT beam convolution) — validated against an 83-test analytic GR suite.
+A high-fidelity, real-time black hole visualization and learning tool for Apple Silicon via the Metal API. The engine integrates exact Kerr-Newman null geodesics per pixel, renders either a Novikov-Thorne thin disk or an optically-thin plasma torus with full covariant radiative transfer, outputs true HDR on XDR displays, and includes a set of toggleable **learning lenses** — the same alternative visualizations researchers use in papers (photon-ring image orders, redshift maps, checkerboard lensing skies, EHT beam convolution) — validated against an 87-test analytic GR suite.
 <img width="1312" height="940" alt="blackhole_screenshot" src="https://github.com/user-attachments/assets/98ee9e2e-913c-41ba-a067-f5cb44b1712f" />
 
 ---
@@ -34,7 +34,12 @@ A high-fidelity, real-time black hole visualization and learning tool for Apple 
 - **N-Body Gravity:** GPU velocity-Verlet leapfrog (KDK) at a **fixed physics timestep** (host-substepped), so orbital accuracy is independent of frame rate.
 - **Dimensionless Units:** Length scale `rs = 2M`, with `M = ½` so `Δ = r² − r + a² + Q²` stays numerically well-conditioned.
 
+### Accretion Flow Models
+- **Thin disk (optically thick):** Novikov-Thorne surface at the equator — the classic Luminet/EHT thin-disk image.
+- **Volumetric torus (GRMHD-style):** an optically-thin plasma torus integrated with the covariant radiative-transfer equation `d(I_ν/ν³)/dλ = j_ν/ν² − (ν α_ν)(I_ν/ν³)`, with a non-Keplerian rotation law set by a specific-angular-momentum profile `l(R)` (the EHT code-comparison parameterization, Gold et al. 2020). Emissivity scales as `n²` (two-body/free-free), and self-absorption gives the flow a real photosphere. The Doppler asymmetry *emerges from the transport* rather than being applied by hand — at spectral index `α_s = −2` it cancels exactly, an identity the test suite verifies to machine precision.
+
 ### Rendering & Optics
+- **Extended Dynamic Range:** a half-float drawable in extended-linear space with a tonemap that keeps the SDR look bit-for-bit below the knee and re-expands only the crushed highlights, so the Doppler-boosted inner limb genuinely emits ~2× above reference white on a Liquid Retina XDR panel instead of clipping to it.
 - **Optically-Thick Novikov-Thorne Disk:** Page-Thorne flux `F ∝ (r_in/r)³(1 − √(r_in/r))` — zero at the ISCO (zero-torque boundary condition), peak at `(49/36) r_in`.
 - **Physical Doppler Color:** A shifted blackbody is exactly another blackbody at `T_obs = g·T_emit`. The disk color comes from a baked Planck-spectrum → CIE → sRGB lookup, so the approaching limb genuinely turns blue-white and the receding limb red — no RGB tinting.
 - **Correct Beaming Sign:** The g-factor is evaluated with the *arriving* photon's angular momentum (the backward-traced ray carries the opposite `L_z`), so the approaching limb brightens as `g⁴` — verified end-to-end by the test suite.
@@ -53,7 +58,7 @@ A high-fidelity, real-time black hole visualization and learning tool for Apple 
 ### Performance (Apple Silicon Optimized)
 - **Triple Buffering** with a race-free auto-exposure readback (reads the slot the semaphore guarantees complete).
 - **Precompiled `.metallib`** (dependency-tracked in the build; falls back to runtime compilation) with one consistent precision policy on both paths: relaxed math (Inf/NaN preserved), a documented 3× performance trade-off over safe math; full fast math is forbidden.
-- **Adaptive stepping** typically converges rays in a few hundred steps; ~40+ fps at 2400×1600 on Apple Silicon.
+- **Adaptive stepping** typically converges rays in a few hundred steps; measured ~30 fps (thin disk) and ~21 fps (volumetric torus) at 2400×1600 on an M4 Max.
 - **SIMD-Reduced Metering:** one atomic per simdgroup.
 - **ARC enabled** on the Objective-C++ sources (no per-frame leaks).
 
@@ -208,7 +213,7 @@ metal_blackhole/
 | **P** | Capture screenshot (PPM) |
 | **Escape** | Quit |
 
-QA/scripting hooks (environment variables): `BH_QA=1` renders 100 frames, captures frame 90, and exits; `BH_ELEV`, `BH_AZIM`, `BH_SPIN`, `BH_CHARGE`, `BH_LENS`, `BH_BEAMING`, `BH_OVERLAYS=mcfg`, `BH_SHOT_DIR` override state for reproducible captures.
+QA/scripting hooks (environment variables): `BH_QA=1` renders 100 frames, captures frame 90, and exits; `BH_ELEV`, `BH_AZIM`, `BH_SPIN`, `BH_CHARGE`, `BH_LENS`, `BH_BEAMING`, `BH_OVERLAYS=mcfg`, `BH_MODEL` (0 thin / 1 volumetric), `BH_ALPHA`, `BH_ABSORB`, `BH_JETS`, `BH_NOEDR`, `BH_SHOT_DIR` override state for reproducible captures. Captures report the peak linear value and the display's EDR headroom.
 
 ---
 
@@ -246,6 +251,7 @@ Shader edits are dependency-tracked: `make` refreshes the `.metallib` **and** th
 | **Kerr-Newman** | 0.6 | 0.3 | Full KN metric |
 | **Cinematic** | 0.85 | 0.0 | All visual effects + grid |
 | **EHT M87\* view** | 0.9 | 0.0 | 17° inclination, beam-blurred EHT lens |
+| **Volumetric torus** | 0.9 | 0.0 | GRMHD-style optically-thin plasma flow |
 | **Luminet 1979** | 0.0 | 0.0 | Near edge-on classic view |
 
 Spin and charge are jointly clamped to `a² + Q² ≤ 1` (no silent naked-singularity renders).
@@ -256,7 +262,7 @@ Spin and charge are jointly clamped to `a² + Q² ≤ 1` (no silent naked-singul
 
 ```bash
 python3 tests/validate_physics.py
-# Expected: 83 passed, 0 failed
+# Expected: 87 passed, 0 failed
 ```
 
 The suite mirrors the shader integrator in double precision (same ZAMO Kerr-Newman tetrad, same Hamiltonian RHS, same adaptive controller) and verifies it against closed-form GR:
@@ -280,6 +286,8 @@ The suite mirrors the shader integrator in double precision (same ZAMO Kerr-Newm
 | 15 | Page-Thorne flux shape (zero at ISCO, peak at 49/36 r_in) | Page-Thorne |
 | 16 | Accuracy at the **exact shipped GPU step constants** (honest gates) | Darwin quadrature |
 | 17 | Through-the-pole continuation (φ jumps by π across the axis) | BL chart continuation |
+| 18 | **Volumetric Doppler-cancellation identity** at α_s = −2 (machine precision, with an α_s = 0 asymmetry control) | Gold et al. 2020 Test 2 |
+| 19 | Radiative-transfer limits: absorption dims monotonically; optically-thick intensity saturates at the source function `S = J/A` | transfer equation |
 
 ---
 

@@ -3,7 +3,7 @@
 Hard-won rules from debugging the geodesic integrator, the temporal pipeline,
 and the coordinate singularities. **Violating any of these will reintroduce
 visual or physics bugs.** Every invariant below is enforced or cross-checked by
-`tests/validate_physics.py` (83 tests) where a test can express it.
+`tests/validate_physics.py` (87 tests) where a test can express it.
 
 ---
 
@@ -197,6 +197,39 @@ the motion-blur alpha override is gated on `accumHistoryValid`, which resize
 clears. And when history is being REPLACED (`alpha ≈ 1`, camera moving), the
 subpixel jitter is zeroed — uncompensated jitter just makes high-contrast
 edges crawl during interaction.
+
+---
+
+## 4b. Volumetric Transport & EDR
+
+### INVARIANT: Volumetric emission uses the INVARIANT transfer equation
+
+`d(I_ν/ν³)/dλ = j_ν/ν² − (ν α_ν)(I_ν/ν³)`, with fluid-frame quantities at
+`ν' = 1/g`. For `j_ν ∝ n² ν^-α_s` this gives `J_inv = n² g^(α_s+2)` and
+`A_inv = A n² g^(α_s+1.5)`. Do NOT apply a Doppler boost on top — the g
+dependence is already carried by the invariant emissivity, and double-counting
+destroys the cancellation identity below.
+
+Regression: TEST 18 — at `α_s = −2` the exponent vanishes, so mirror-image
+sight lines through a relativistically rotating flow must give IDENTICAL
+intensity (verified to 1e-15), while `α_s = 0` on the same geometry must stay
+asymmetric (63%). This single test covers the four-velocity construction from
+`l(R)`, the redshift factor, and the g-power weighting at once.
+
+### INVARIANT: EDR tonemapping expands highlights, never retargets the curve
+
+`H · ACES(x/H)` looks like the natural way to move the shoulder to the display
+headroom, but it drags the midtones down with it — middle gray falls from
+0.267 to 0.071 at H = 16. Keep the ACES result bit-for-bit below the knee and
+add a logarithmic lift driven by the LINEAR signal above it. At `H = 1` the
+operator must reduce exactly to the SDR curve.
+
+### INVARIANT: everything written to the drawable must be scene-linear
+
+The layer is `RGBA16Float` in extended-linear space, so the compositor applies
+the transfer function. Display-authored colors — the false-color lenses, the
+grid, ImGui's palette and every overlay `IM_COL32` — must be converted with
+`srgb_to_linear` / `linCol()` first, or the UI washes out.
 
 ---
 

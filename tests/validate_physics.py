@@ -862,6 +862,136 @@ check_true(f"Kerr a=0.9 pole pass (min theta = {min_th9:.4f}), phi = pi + drag d
 print()
 
 # ============================================================
+#  Volumetric torus: mirror of the shader's radiative transfer
+# ============================================================
+
+def torus_sample(r_rs, cos_th, sin_th, a, Q2, L_arr, r0, h, l0, temp):
+    """Mirror of torus_sample() in geodesic.metal. Returns (n, g) or None."""
+    r_M = 2.0 * r_rs
+    R_cyl = r_M * sin_th
+    ar = (r_M - r0) / (0.4 * r0)
+    az = h * cos_th
+    n = math.exp(-0.5 * (ar * ar + az * az))
+    if n < 2.0e-3:
+        return None
+    l_rs = 0.5 * (l0 / (1.0 + R_cyl)) * max(R_cyl, 1e-4) ** 1.5
+    Sigma = r_rs * r_rs + a * a * cos_th * cos_th
+    s2 = max(sin_th * sin_th, 1e-6)
+    m_kn = r_rs - Q2
+    gtt = -(1.0 - m_kn / Sigma)
+    gtphi = -a * m_kn * s2 / Sigma
+    gphph = ((r_rs * r_rs + a * a) * Sigma + a * a * m_kn * s2) * s2 / Sigma
+    denom = gphph + l_rs * gtphi
+    if abs(denom) < 1e-9:
+        denom = math.copysign(1e-9, denom if denom else 1.0)
+    Omega = -(gtphi + l_rs * gtt) / denom
+    U_denom = -(gtt + 2.0 * Omega * gtphi + Omega * Omega * gphph)
+    if U_denom <= 1e-6:
+        return None
+    Ut = 1.0 / math.sqrt(U_denom)
+    g = 1.0 / max(Ut * (1.0 - Omega * L_arr), 1e-3)
+    return n, g
+
+
+def trace_volumetric(cam_pos, ray_dir, spin, alpha_s, r0=7.0, h=6.0, l0=1.0,
+                     absorb=0.0, eps=0.02):
+    """Integrate the invariant transfer equation along a backward ray.
+    Returns the emergent invariant intensity I_nu/nu^3."""
+    a = 0.5 * spin
+    Q2 = 0.0
+    r_h = event_horizon(spin)
+    s, L, QC, L_arr = zamo_init(cam_pos, ray_dir, a, Q2)
+    r_max = 0.5 * (r0 * 2.4) + 1.0
+    I_inv = 0.0
+    trans = 1.0
+    for _ in range(40000):
+        if s[0] < r_h * 1.02 or s[0] > cam_pos_radius(cam_pos) * 1.05:
+            break
+        dlam = adaptive_step(s, a, Q2, L, QC, r_h, eps, E=-1.0)
+        if s[0] < r_max:
+            dlam = min(dlam, 0.35)
+        s = geo_rk4(s, dlam, a, Q2, L, QC, E=-1.0)
+        if s[1] < 0:
+            s = (s[0], -s[1], s[2], s[3], -s[4])
+        elif s[1] > math.pi:
+            s = (s[0], 2 * math.pi - s[1], s[2], s[3], -s[4])
+        c = math.cos(s[1]); sn = math.sin(s[1])
+        if s[0] < r_max and s[0] > r_h * 1.05:
+            ts = torus_sample(s[0], c, sn, a, Q2, L_arr, r0, h, l0, 6500.0)
+            if ts:
+                n, g = ts
+                ne2 = n * n
+                J_inv = ne2 * g ** (alpha_s + 2.0)
+                A_inv = absorb * ne2 * g ** (alpha_s + 1.5)
+                I_inv += trans * J_inv * dlam
+                if A_inv > 0.0:
+                    trans *= math.exp(-A_inv * dlam)
+        if trans < 1e-4:
+            break
+    return I_inv
+
+
+def cam_pos_radius(p):
+    return math.sqrt(p[0] ** 2 + p[1] ** 2 + p[2] ** 2)
+
+
+# --- TEST 18: Gold et al. Test 2 — exact Doppler cancellation at alpha_s = -2 ---
+print("TEST 18: Volumetric transport — Doppler cancellation identity")
+print("-" * 40)
+# Gold et al. 2020 construct Test 2 so relativistic beaming from the rotating
+# flow is cancelled EXACTLY by the emissivity's frequency dependence: at
+# alpha_s = -2 the invariant emissivity J = n^2 g^(alpha_s+2) = n^2 is
+# g-independent, so the image must be perfectly symmetric despite the plasma
+# orbiting at relativistic speed. This is the most sensitive differential
+# check available on the whole transport chain (four-velocity construction,
+# redshift, and the g-power weighting) — and it needs no reference data.
+cam_v = (-30.0, 6.0, 0.0)
+
+
+def limb_pair(alpha_s):
+    """Intensities through mirror-image sight lines (approaching vs receding)."""
+    out = []
+    for zsign in (+1.0, -1.0):
+        # Aim at the ring on each side; mirror geometry about the x-y plane.
+        tgt = (0.0, 0.0, zsign * 3.5)
+        rd = tuple(tgt[i] - cam_v[i] for i in range(3))
+        nn = math.sqrt(sum(c * c for c in rd))
+        out.append(trace_volumetric(cam_v, tuple(c / nn for c in rd), 0.0, alpha_s))
+    return out
+
+
+I_a, I_b = limb_pair(-2.0)
+rel = abs(I_a - I_b) / max(abs(I_a), 1e-12)
+check_true(f"alpha_s = -2: mirror sight lines match to {rel:.2e} (I = {I_a:.5f})",
+           I_a > 1e-6 and rel < 1e-6)
+# Sensitivity control: at alpha_s = 0 the same geometry MUST be asymmetric,
+# otherwise the test above would pass for a renderer with no Doppler at all.
+J_a, J_b = limb_pair(0.0)
+asym = abs(J_a - J_b) / max(abs(J_a), 1e-12)
+check_true(f"alpha_s = 0: same geometry IS asymmetric ({asym:.3f} relative)",
+           asym > 0.05)
+print()
+
+# --- TEST 19: invariant transport reduces to the optically-thin/thick limits ---
+print("TEST 19: Radiative transfer limits (optically thin and thick)")
+print("-" * 40)
+rd0 = (1.0, -0.2, 0.0)
+nn0 = math.sqrt(sum(c * c for c in rd0))
+rd0 = tuple(c / nn0 for c in rd0)
+I_thin = trace_volumetric(cam_v, rd0, 0.0, 0.0, absorb=0.0)
+I_tau1 = trace_volumetric(cam_v, rd0, 0.0, 0.0, absorb=1.0)
+I_thick = trace_volumetric(cam_v, rd0, 0.0, 0.0, absorb=60.0)
+check_true(f"absorption strictly dims the ray ({I_thin:.4f} > {I_tau1:.4f} > {I_thick:.4f})",
+           I_thin > I_tau1 > I_thick > 0.0)
+# In the optically thick limit the emergent intensity saturates at the source
+# function S = J/A = g^0.5 / absorb, independent of path length: doubling the
+# absorption must halve it (to within the g^0.5 profile weighting).
+I_thick2 = trace_volumetric(cam_v, rd0, 0.0, 0.0, absorb=120.0)
+ratio = I_thick / max(I_thick2, 1e-12)
+check("optically-thick source function scales as 1/absorb", ratio, 2.0, 0.05)
+print()
+
+# ============================================================
 #  SUMMARY
 # ============================================================
 print("=" * 70)
