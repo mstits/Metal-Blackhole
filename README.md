@@ -70,6 +70,7 @@ A high-fidelity, real-time black hole visualization and learning tool for Apple 
 - **Triple Buffering** with a race-free auto-exposure readback (reads the slot the semaphore guarantees complete).
 - **Precompiled `.metallib`** (dependency-tracked in the build; falls back to runtime compilation) with one consistent precision policy on both paths: relaxed math (Inf/NaN preserved), a documented 3× performance trade-off over safe math; full fast math is forbidden.
 - **Adaptive stepping** typically converges rays in a few hundred steps; measured ~30 fps (thin disk) and ~21 fps (volumetric torus) at 2400×1600 on an M4 Max.
+- **Optional closed-form geodesics** (Gralla-Lupsasca elliptic integrals): evaluates equatorial crossings directly instead of stepping. Measured **4x faster on the raytrace** where the disk fills the frame (16.6 -> 3.9 ms/frame), and break-even on sky-dominated framings, since rays that miss the disk still fall back to RK4 and mixed threadgroups pay both. Agreement with the RK4 path: **0.018% of pixels differ in image order, all of them anti-aliased category edges** — that dual-path agreement is itself a validation of both.
 - **SIMD-Reduced Metering:** one atomic per simdgroup.
 - **ARC enabled** on the Objective-C++ sources (no per-frame leaks).
 

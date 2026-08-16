@@ -115,7 +115,8 @@ struct SystemUniforms {
     float refine_tol;       // target relative standard error of the pixel mean
     float _padf2[3];
     int   accum_mode;       // ACCUM_* above
-    int   _padi2[3];
+    int   solver_mode;      // 0 = RK4 integration, 1 = closed-form (thin disk)
+    int   _padi2[2];
 };
 
 struct ObjectsUniform {

@@ -73,6 +73,7 @@ struct SimSettings {
   float vignetteIntensity  = 0.6f;
   float ehtBeamFwhm        = 2.6f;      // telescope beam FWHM in rs units
 
+  bool analyticSolver  = false;    // closed-form geodesics (thin disk)
   int  bhMode          = BH_KERR_NEWMAN;
   int  projection      = PROJ_PERSPECTIVE;
   float mpM1           = 0.25f;   // code units (rs = 2 M_total)
@@ -740,6 +741,7 @@ public:
     s.edr = g_sim.enEDR ? edrHeadroom : 1.0f;
     s.dmodel = g_sim.diskModel;
     s.bmode = g_sim.bhMode; s.proj = g_sim.projection;
+    s.dmodel += g_sim.analyticSolver ? 100 : 0;
     s.mp1 = g_sim.mpM1; s.mp2 = g_sim.mpM2;
     s.msep = g_sim.mpSep; s.mglow = g_sim.mpGlow;
     s.lens = g_sim.lensMode; s.beaming = g_sim.beamingMode;
@@ -838,6 +840,7 @@ public:
     sysPtr->photon_ring_boost = std::clamp(g_sim.photonRingBoost, 0.0f, 4.0f);
     sysPtr->accum_alpha  = accumAlpha;
     sysPtr->accum_mode   = ACCUM_HOST_ALPHA;
+    sysPtr->solver_mode  = g_sim.analyticSolver ? 1 : 0;
     sysPtr->refine_tol   = 0.02f;
     // Subpixel jitter converges under accumulation; when history is being
     // REPLACED (camera moving), an uncompensated jitter just makes edges crawl
@@ -1449,6 +1452,13 @@ public:
                                "  clamped to Q = %.3f (a^2 + Q^2 <= 1)", charge_c);
         ImGui::SliderFloat("Simulation Speed", &g_sim.timeScale, 0.0f, 5.0f);
         ImGui::Checkbox("N-Body Gravitation", &g_sim.Gravity);
+        ImGui::Checkbox("Closed-form geodesics", &g_sim.analyticSolver);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Evaluate equatorial crossings from the exact elliptic-integral\n"
+            "solution instead of stepping. Thin disk only; rays that miss the\n"
+            "disk, and cameras inside the photon shell, still use RK4.\n"
+            "The two paths should be visually identical — that agreement is\n"
+            "itself a validation.");
     }
 
     if (ImGui::CollapsingHeader("Accretion Flow", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1813,6 +1823,8 @@ int main() {
   if (const char* e = getenv("BH_ALPHA")) g_sim.torusAlpha = (float)atof(e);
   if (const char* e = getenv("BH_ABSORB")) g_sim.torusAbsorb = (float)atof(e);
   if (getenv("BH_NOEDR")) g_sim.enEDR = false;
+  if (getenv("BH_ANALYTIC")) g_sim.analyticSolver = true;
+  if (const char* e = getenv("BH_ROUT")) g_sim.diskOuterRadius = (float)atof(e);
   if (const char* e = getenv("BH_BINARY")) {
     g_sim.bhMode = BH_MP_BINARY; g_sim.mpSep = (float)atof(e);
     g_sim.enNebula = true;
