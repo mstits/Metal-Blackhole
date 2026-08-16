@@ -8,6 +8,8 @@
 #import <QuartzCore/QuartzCore.h>
 #import <ImageIO/ImageIO.h>
 #import <CoreGraphics/CoreGraphics.h>
+#define EXR_PARALLEL
+#include "exr_out.h"
 
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
@@ -389,36 +391,89 @@ static void linearizeImGuiStyle() {
 // Write scene-linear half-float RGBA as an OpenEXR via ImageIO. The buffer is
 // the accumulated HDR render target, so the file holds true radiometric values
 // (highlights well above 1.0) with no tonemapping or UI baked in.
-static void writeEXR(id<MTLBuffer> buf, int w, int h, NSUInteger bpr, int samples) {
+static void writeEXR(id<MTLBuffer> buf, int w, int h, NSUInteger bpr, int samples,
+                     int projection) {
   const char *dir = getenv("BH_SHOT_DIR");
   char path[512];
   snprintf(path, sizeof(path), "%s/bh_ref_%d_%d.exr",
            dir ? dir : "/tmp", (int)getpid(), frameCount);
-  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
-  CFDataRef data = CFDataCreate(NULL, (const UInt8 *)buf.contents, bpr * h);
-  CGDataProviderRef prov = CGDataProviderCreateWithCFData(data);
-  CGBitmapInfo bi = (CGBitmapInfo)kCGImageAlphaNoneSkipLast
-                  | kCGBitmapFloatComponents | kCGBitmapByteOrder16Little;
-  CGImageRef img = CGImageCreate(w, h, 16, 64, bpr, cs, bi, prov,
-                                 NULL, false, kCGRenderingIntentDefault);
-  bool ok = false;
-  if (img) {
-    CFStringRef url_s = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
-    CFURLRef url = CFURLCreateWithFileSystemPath(NULL, url_s, kCFURLPOSIXPathStyle, false);
-    CGImageDestinationRef dst =
-        CGImageDestinationCreateWithURL(url, CFSTR("com.ilm.openexr-image"), 1, NULL);
-    if (dst) {
-      CGImageDestinationAddImage(dst, img, NULL);
-      ok = CGImageDestinationFinalize(dst);
-      CFRelease(dst);
+
+  // The readback is tightly packed RGBA16Float (bytesPerRow = w*8), which is
+  // exactly what the writer's memcpy path expects.
+  exr_image im = {};
+  im.width = w; im.height = h;
+  im.pixels = buf.contents;
+  im.src_comps = 4;
+  im.src_is_half = 1;
+  im.write_alpha = 0;              // alpha is a constant 1 in this pipeline
+  im.type = EXR_HALF;
+  im.compression = EXR_ZIP;
+  bool ok = (exr_write(path, &im) == 0);
+  printf(ok ? "Reference EXR: %s (%dx%d, %d samples, bit-exact)\n"
+            : "Reference EXR FAILED: %s (%dx%d, %d samples)\n",
+         path, w, h, samples + 1);
+  (void)bpr;
+
+  // A 360 panorama is only usable if a player can recognise it, and ImageIO's
+  // OpenEXR writer silently discards metadata (verified: GPano survives in
+  // JPEG/PNG/HEIC/TIFF, vanishes in EXR). So panoramas also get a tonemapped
+  // 16-bit PNG carrying the GPano XMP.
+  if (projection != PROJ_EQUIRECT) return;
+  char pngPath[512];
+  snprintf(pngPath, sizeof(pngPath), "%s/bh_pano_%d_%d.png",
+           dir ? dir : "/tmp", (int)getpid(), frameCount);
+  std::vector<uint16_t> rgb16((size_t)w * h * 3);
+  const __fp16 *src = (const __fp16 *)buf.contents;
+  for (size_t i = 0; i < (size_t)w * h; i++) {
+    for (int k = 0; k < 3; k++) {
+      float v = (float)src[i * 4 + k];
+      // SDR view of the reference data: ACES then sRGB encode.
+      float t = (v * (2.51f * v + 0.03f)) / (v * (2.43f * v + 0.59f) + 0.14f);
+      t = std::clamp(t, 0.0f, 1.0f);
+      t = (t <= 0.0031308f) ? t * 12.92f : 1.055f * std::pow(t, 1.0f / 2.4f) - 0.055f;
+      uint16_t q = (uint16_t)(std::clamp(t, 0.0f, 1.0f) * 65535.0f + 0.5f);
+      rgb16[i * 3 + k] = (uint16_t)((q >> 8) | (q << 8));   // PNG is big-endian
     }
-    CFRelease(url); CFRelease(url_s);
+  }
+  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  CFDataRef data = CFDataCreate(NULL, (const UInt8 *)rgb16.data(),
+                                (CFIndex)(rgb16.size() * 2));
+  CGDataProviderRef prov = CGDataProviderCreateWithCFData(data);
+  CGImageRef img = CGImageCreate(w, h, 16, 48, (size_t)w * 6, cs,
+                                 (CGBitmapInfo)kCGImageAlphaNone, prov, NULL, false,
+                                 kCGRenderingIntentDefault);
+  if (img) {
+    CFStringRef ps = CFStringCreateWithCString(NULL, pngPath, kCFStringEncodingUTF8);
+    CFURLRef url = CFURLCreateWithFileSystemPath(NULL, ps, kCFURLPOSIXPathStyle, false);
+    CGImageDestinationRef dst =
+        CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL);
+    if (dst) {
+      CGMutableImageMetadataRef md = CGImageMetadataCreateMutable();
+      CGImageMetadataRegisterNamespaceForPrefix(
+          md, CFSTR("http://ns.google.com/photos/1.0/panorama/"), CFSTR("GPano"), NULL);
+      auto setNum = [&](const char *key, int val) {
+        CFStringRef k = CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
+        CFStringRef v = CFStringCreateWithFormat(NULL, NULL, CFSTR("%d"), val);
+        CGImageMetadataSetValueWithPath(md, NULL, k, v);
+        CFRelease(k); CFRelease(v);
+      };
+      CGImageMetadataSetValueWithPath(md, NULL, CFSTR("GPano:ProjectionType"),
+                                      CFSTR("equirectangular"));
+      setNum("GPano:FullPanoWidthPixels", w);
+      setNum("GPano:FullPanoHeightPixels", h);
+      setNum("GPano:CroppedAreaImageWidthPixels", w);
+      setNum("GPano:CroppedAreaImageHeightPixels", h);
+      setNum("GPano:CroppedAreaLeftPixels", 0);
+      setNum("GPano:CroppedAreaTopPixels", 0);
+      CGImageDestinationAddImageAndMetadata(dst, img, md, NULL);
+      bool pok = CGImageDestinationFinalize(dst);
+      printf("  360 companion: %s (%s)\n", pngPath, pok ? "GPano tagged" : "FAILED");
+      CFRelease(md); CFRelease(dst);
+    }
+    CFRelease(url); CFRelease(ps);
     CGImageRelease(img);
   }
   CGDataProviderRelease(prov); CFRelease(data); CGColorSpaceRelease(cs);
-  printf(ok ? "Reference EXR: %s (%dx%d, %d accumulated samples)\n"
-            : "Reference EXR FAILED: %s (%dx%d, %d samples)\n",
-         path, w, h, samples + 1);
 }
 
 // Halton low-discrepancy sequence for subpixel jitter.
@@ -1037,7 +1092,7 @@ public:
 
       if (exrThisFrame) {
           [cmd waitUntilCompleted];
-          writeEXR(exrReadback, drawableW, drawableH, exrBpr, accumN);
+          writeEXR(exrReadback, drawableW, drawableH, exrBpr, accumN, g_sim.projection);
       }
 
       if (captureThisFrame) {
@@ -1523,6 +1578,12 @@ public:
   }
 
   void exportStill(int W, int H, int samples, int projection) {
+    // Spherical projections are 2:1 by definition — a 16:9 equirect is
+    // stretched by every player, and the Mollweide ellipse test stops
+    // matching the frame. Enforce it here so every caller is covered.
+    if (projection != PROJ_PERSPECTIVE) H = W / 2;
+    // BUG 3: Metal aborts (assertion, not a nil return) above 16384 texels.
+    W = std::min(W, 16384); H = std::min(H, 16384);
     printf("Reference still: %dx%d, %d samples, projection %d ...\n",
            W, H, samples, projection);
     MTLTextureDescriptor *td = [MTLTextureDescriptor
@@ -1541,6 +1602,22 @@ public:
     memcpy(objB.contents, objUniformBuffer[currentFrame].contents, sizeof(ObjectsUniform));
     CameraData *cp = (CameraData *)camB.contents;
     cp->aspect = float(W) / float(H);
+    if (projection != PROJ_PERSPECTIVE) {
+      // Level the horizon. A 360 viewer cannot roll or pitch their head to
+      // compensate for a tilted projection — a pitched horizon baked into a
+      // panorama is the classic vection-discomfort trigger — so lock the pole
+      // to the spin axis and put the image centre on the horizontal.
+      glm::vec3 pole(0.0f, 1.0f, 0.0f);
+      glm::vec3 f = glm::vec3(cp->camForward);
+      glm::vec3 fh = f - pole * glm::dot(f, pole);
+      float L = glm::length(fh);
+      glm::vec3 fwdP = (L > 1e-4f) ? fh / L : glm::vec3(1.0f, 0.0f, 0.0f);
+      glm::vec3 rgtP = glm::normalize(glm::cross(fwdP, pole));
+      glm::vec3 upP  = glm::cross(rgtP, fwdP);          // == pole exactly
+      cp->camForward = glm::vec4(fwdP, 0.0f);
+      cp->camRight   = glm::vec4(rgtP, 0.0f);
+      cp->camUp      = glm::vec4(upP, 0.0f);
+    }
     SystemUniforms *sp = (SystemUniforms *)sysB.contents;
     sp->projection = projection;
 
@@ -1587,7 +1664,7 @@ public:
       [bl endEncoding];
       [cb commit]; [cb waitUntilCompleted];
     }
-    writeEXR(rb, W, H, bpr, samples - 1);
+    writeEXR(rb, W, H, bpr, samples - 1, projection);
   }
 
   void resize(int w, int h) {

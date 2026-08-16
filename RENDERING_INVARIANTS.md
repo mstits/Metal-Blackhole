@@ -3,7 +3,7 @@
 Hard-won rules from debugging the geodesic integrator, the temporal pipeline,
 and the coordinate singularities. **Violating any of these will reintroduce
 visual or physics bugs.** Every invariant below is enforced or cross-checked by
-`tests/validate_physics.py` (94 tests) where a test can express it.
+`tests/validate_physics.py` (97 tests) where a test can express it.
 
 ---
 
@@ -260,9 +260,46 @@ Rays trapped on long-lived chaotic orbits between the holes are what make the
 basin boundary fractal. Classifying them as captured would artificially fill
 in the shadow; they get their own category (yellow in the basin lens).
 
+### INVARIANT: budget-exhausted rays must not render as sky
+
+`trace_mp` returns fate 0 (trapped), 1 (captured), 2 (escaped). A ray still
+whirling in the chaotic region between the holes is not looking at the sky, and
+its `exit_dir` is meaningless. The production branch tests `fate != 2`, not
+`fate == 1` — getting this wrong paints background stars into exactly the
+fractal eyebrow region where it is most conspicuous. (Latent for an exterior
+camera, which never exhausts the budget; reachable at ~0.03% of rays once the
+camera flies between the holes.)
+
+### INVARIANT: the acceleration is exactly perpendicular to the velocity
+
+`a·ẋ = (2/U)[(∇U·ẋ) − (∇U·ẋ)|ẋ|²] = 0` whenever `|ẋ| = E = 1`. So the flow
+preserves `|ẋ|` identically, and the shader's re-normalisation is a projection
+onto the exact invariant manifold — legitimate, not a fudge. (Equivalently: MP
+null geodesics are exactly Fermat rays in a medium of refractive index
+`n = U²`, which is *why* the coordinate speed is constant. That also makes the
+lensing independently reproducible with any classical ray tracer.)
+
 Regressions: TEST 20 (b = 4m vs the independent Kerr-Newman path),
 TEST 21 (L_x, drift, exact x → −x mirror symmetry), TEST 22 (wide-separation
-limit to 1e-4).
+limit to 1e-4), TEST 23 (the `3π` extremal-charge deflection signature, which
+distinguishes this spacetime from Schwarzschild's `15π/4`).
+
+### INVARIANT: reference EXRs never go through ImageIO
+
+macOS *can* write `com.ilm.openexr-image`, but the encoder ICC-transforms to
+sRGB primaries first. Measured: 35.5% of pixels perturbed by multiples of
+1/65536, and channels whose source was exactly 0.0 come back nonzero — the
+shadow interior stops being exactly black. Reference data must be bit-exact,
+so the project vendors its own writer (`include/exr_out.h`).
+
+### INVARIANT: spherical projections are levelled and 2:1
+
+`exportStill` re-derives the basis with the pole locked to the world spin axis
+for any non-perspective projection, and forces `H = W/2`. A tilted horizon
+baked into a panorama is the classic VR discomfort trigger, and a 16:9
+"equirect" is stretched by every player. Both fixes live inside `exportStill`
+so every caller inherits them. Export width is clamped to 16384 — Metal
+*aborts* on a larger texture descriptor rather than returning nil.
 
 ---
 

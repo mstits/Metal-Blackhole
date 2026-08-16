@@ -1154,6 +1154,51 @@ for sep in (40.0, 400.0):
                rel < (0.02 if sep < 100 else 0.005))
 print()
 
+# --- TEST 23: MP weak-field deflection carries the EXTREMAL-CHARGE signature ---
+print("TEST 23: Extremal-RN deflection coefficient (3pi, not Schwarzschild's 15pi/4)")
+print("-" * 40)
+# alpha(b) = 4m/b + 3*pi*m^2/b^2 + O(b^-3) for extremal Reissner-Nordstrom,
+# versus 4M/b + (15*pi/4)*M^2/b^2 for Schwarzschild. The charge shows up in the
+# SECOND-order term, so this both validates the MP integrator's weak field and
+# proves it is bending light like a charged hole rather than a neutral one.
+
+
+def exact_defl_ern(b, m=1.0, N=120000):
+    """Exact extremal-RN deflection: 2 int_0^u0 du/sqrt(1/b^2 - u^2(1-mu)^2) - pi."""
+    def gg(u):
+        return 1.0 / (b * b) - u * u * (1 - m * u) ** 2
+    lo, hi = 0.0, 1.0 / (2 * m)
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if gg(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    u0 = lo
+    tot = 0.0
+    for k in range(N):
+        t = (k + 0.5) / N
+        u = u0 * (1 - t * t)
+        v = gg(u)
+        if v > 0:
+            tot += 2.0 * u0 * t / math.sqrt(v) / N
+    return 2.0 * tot - math.pi
+
+
+R_far = 20000.0
+for b in (20.0, 50.0):
+    st = mp_trace((-R_far, b, 0.0), (1.0, 0.0, 0.0), one_hole, eps=0.005)
+    vf = st[3]
+    alpha_traced = abs(math.atan2(vf[1], vf[0]))
+    check(f"MP-traced deflection at b = {b:.0f}m", alpha_traced, exact_defl_ern(b), 3e-3)
+# The discriminating coefficient itself.
+b_big = 1000.0
+c2 = (exact_defl_ern(b_big) - 4.0 / b_big) * b_big * b_big
+check_true(f"second-order coefficient -> 3pi = {3 * math.pi:.4f} (got {c2:.4f}), "
+           f"NOT Schwarzschild's {15 * math.pi / 4:.4f}",
+           abs(c2 - 3 * math.pi) < abs(c2 - 15 * math.pi / 4))
+print()
+
 # ============================================================
 #  SUMMARY
 # ============================================================
